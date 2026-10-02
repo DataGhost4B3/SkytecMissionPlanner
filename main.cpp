@@ -161,233 +161,6 @@ public:
     }
 };
 
-// const char* QML_SRC = R"qml(
-// import QtQuick
-// import QtQuick.Controls
-// import QtQuick.Layouts
-// import QtQuick.Dialogs
-// import QtLocation
-// import QtPositioning
-//
-// ApplicationWindow {
-//     title: "HARP Mission Planner"
-//     visible: true
-//     width: 1250
-//     height: 700
-//     color: "#1e1e1e"
-//
-//     ListModel {
-//         id: windModel
-//         Component.onCompleted: {
-//             append({alt: 0, spd: 0, dir: 0});
-//             append({alt: 1000, spd: 5, dir: 20});
-//             append({alt: 3000, spd: 7, dir: 16});
-//             append({alt: 5000, spd: 10, dir: 25});
-//             append({alt: 8000, spd: 15, dir: 30});
-//         }
-//     }
-//
-//     FileDialog {
-//         id: saveDialog
-//         fileMode: FileDialog.SaveFile
-//         nameFilters: ["KML Files (*.kml)"]
-//         onAccepted: {
-//             if (HarpController.generate(buildParams(), buildWind(), saveDialog.selectedFile)) {
-//                 console.log("Successfully generated KML file!");
-//             }
-//         }
-//     }
-//
-//     function buildParams() {
-//         return {
-//             lzLat: Number(i_lat.text), lzLon: Number(i_lon.text), lzElev: Number(i_elev.text),
-//             jumpAlt: Number(i_jalt.text), openAlt: Number(i_oalt.text), airV: Number(i_airv.text),
-//             airH: Number(i_airh.text), gr: Number(i_gr.text), descV: Number(i_descv.text), wt: Number(i_wt.text)
-//         };
-//     }
-//
-//     function buildWind() {
-//         var w = [];
-//         for (var i = 0; i < windModel.count; i++) {
-//             w.push({ alt: Number(windModel.get(i).alt), spd: Number(windModel.get(i).spd), dir: Number(windModel.get(i).dir) });
-//         }
-//         return w;
-//     }
-//
-//     function updateMapPreview() {
-//         var preview = HarpController.calculatePreview(buildParams(), buildWind());
-//
-//         // Set Map Envelope Polygon
-//         var path = [];
-//         for (var i = 0; i < preview.envelope.length; i++) {
-//             path.push(QtPositioning.coordinate(preview.envelope[i].lat, preview.envelope[i].lon));
-//         }
-//         harpPolygon.path = path;
-//
-//         // Set Markers
-//         var centerCoord = QtPositioning.coordinate(preview.centerLat, preview.centerLon);
-//         harpMarker.coordinate = centerCoord;
-//         lzMarker.coordinate = QtPositioning.coordinate(Number(i_lat.text), Number(i_lon.text));
-//
-//         // Set Run-In Line and T-Points
-//         tPointsModel.clear();
-//         var linePath = [centerCoord];
-//         for (var j = 0; j < preview.tPoints.length; j++) {
-//             tPointsModel.append({ "lat": preview.tPoints[j].lat, "lon": preview.tPoints[j].lon, "label": preview.tPoints[j].label });
-//             linePath.push(QtPositioning.coordinate(preview.tPoints[j].lat, preview.tPoints[j].lon));
-//         }
-//         runInLine.path = linePath;
-//
-//         map.center = centerCoord;
-//     }
-//
-//     RowLayout {
-//         anchors.fill: parent
-//         anchors.margins: 10
-//         spacing: 15
-//
-//         // Left Panel: Configurations
-//         ColumnLayout {
-//             Layout.fillHeight: true
-//             Layout.preferredWidth: 380
-//
-//             GroupBox {
-//                 title: "Jump Parameters"
-//                 Layout.fillWidth: true
-//                 GridLayout {
-//                     columns: 4
-//                     anchors.fill: parent
-//
-//                     Label { text: "LZ Lat:"; color: "white" } TextField { id: i_lat; text: "29.503121"; Layout.fillWidth: true }
-//                     Label { text: "LZ Lon:"; color: "white" } TextField { id: i_lon; text: "78.006743"; Layout.fillWidth: true }
-//                     Label { text: "LZ Elev:"; color: "white" } TextField { id: i_elev; text: "1968"; Layout.fillWidth: true }
-//                     Label { text: "Jump Alt:"; color: "white" } TextField { id: i_jalt; text: "7000"; Layout.fillWidth: true }
-//                     Label { text: "Open Alt:"; color: "white" } TextField { id: i_oalt; text: "5000"; Layout.fillWidth: true }
-//                     Label { text: "A/C KTS:"; color: "white" } TextField { id: i_airv; text: "90"; Layout.fillWidth: true }
-//                     Label { text: "A/C HDG:"; color: "white" } TextField { id: i_airh; text: "25"; Layout.fillWidth: true }
-//                     Label { text: "Glide R.:"; color: "white" } TextField { id: i_gr; text: "2.6"; Layout.fillWidth: true }
-//                     Label { text: "Desc V:"; color: "white" } TextField { id: i_descv; text: "23"; Layout.fillWidth: true }
-//                     Label { text: "Mass (kg):"; color: "white" } TextField { id: i_wt; text: "120"; Layout.fillWidth: true }
-//                 }
-//             }
-//
-//             GroupBox {
-//                 title: "Wind Profile [Alt(ft), Speed(kts), Dir(deg)]"
-//                 Layout.fillHeight: true
-//                 Layout.fillWidth: true
-//                 ListView {
-//                     id: windList
-//                     anchors.fill: parent
-//                     clip: true
-//                     model: windModel
-//                     delegate: RowLayout {
-//                         width: ListView.view.width; spacing: 5
-//                         TextField { text: model.alt; onEditingFinished: windModel.setProperty(index, "alt", Number(text)); Layout.fillWidth: true }
-//                         TextField { text: model.spd; onEditingFinished: windModel.setProperty(index, "spd", Number(text)); Layout.fillWidth: true }
-//                         TextField { text: model.dir; onEditingFinished: windModel.setProperty(index, "dir", Number(text)); Layout.fillWidth: true }
-//                         Button { text: "X"; onClicked: windModel.remove(index) }
-//                     }
-//                 }
-//             }
-//
-//             RowLayout {
-//                 Layout.fillWidth: true
-//                 Button { text: "+ Add Layer"; Layout.fillWidth: true; onClicked: windModel.append({alt: 0, spd: 0, dir: 0}) }
-//                 Button { text: "Clear Data"; Layout.fillWidth: true; onClicked: windModel.clear() }
-//             }
-//
-//             RowLayout {
-//                 Layout.fillWidth: true
-//                 Button {
-//                     text: "PREVIEW MAP"
-//                     Layout.fillWidth: true; Layout.preferredHeight: 50
-//                     onClicked: updateMapPreview()
-//                 }
-//                 Button {
-//                     text: "GENERATE KML"
-//                     Layout.fillWidth: true; Layout.preferredHeight: 50
-//                     onClicked: saveDialog.open()
-//                 }
-//             }
-//         }
-//
-//         // Right Panel: 2D Interactive Map
-//         Rectangle {
-//             Layout.fillWidth: true
-//             Layout.fillHeight: true
-//             color: "black"
-//
-//             Map {
-//                 id: map
-//                 anchors.fill: parent
-//
-//                 plugin: Plugin {
-//                     name: "osm"
-//                     // Disables the broken Qt satellite redirect server
-//                     PluginParameter { name: "osm.mapping.providersrepository.disabled"; value: "true" }
-//                 }
-//
-//                 // Force standard Street Map
-//                 Component.onCompleted: {
-//                     if (supportedMapTypes.length > 0) {
-//                         activeMapType = supportedMapTypes[0];
-//                     }
-//                 }
-//
-//                 center: QtPositioning.coordinate(29.503121, 78.006743)
-//                 zoomLevel: 11
-//
-//                 MapPolygon {
-//                     id: harpPolygon
-//                     color: "#4000FF00"
-//                     border.color: "green"
-//                     border.width: 2
-//                 }
-//
-//                 MapPolyline {
-//                     id: runInLine
-//                     line.color: "red"
-//                     line.width: 2
-//                 }
-//
-//                 MapQuickItem {
-//                     id: lzMarker
-//                     anchorPoint.x: lzIcon.width / 2; anchorPoint.y: lzIcon.height / 2
-//                     sourceItem: Rectangle {
-//                         id: lzIcon; width: 14; height: 14; radius: 7; color: "blue"; border.color: "white"; border.width: 2
-//                         Text { text: "LZ"; anchors.bottom: parent.top; color: "blue"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
-//                     }
-//                 }
-//
-//                 MapQuickItem {
-//                     id: harpMarker
-//                     anchorPoint.x: harpIcon.width / 2; anchorPoint.y: harpIcon.height / 2
-//                     sourceItem: Rectangle {
-//                         id: harpIcon; width: 14; height: 14; radius: 7; color: "red"; border.color: "white"; border.width: 2
-//                         Text { text: "HARP"; anchors.bottom: parent.top; color: "red"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
-//                     }
-//                 }
-//
-//                 MapItemView {
-//                     model: ListModel { id: tPointsModel }
-//                     delegate: MapQuickItem {
-//                         coordinate: QtPositioning.coordinate(model.lat, model.lon)
-//                         anchorPoint.x: 6; anchorPoint.y: 6
-//                         sourceItem: Rectangle {
-//                             width: 12; height: 12; radius: 6; color: "orange"; border.color: "white"; border.width: 2
-//                             Text {
-//                                 text: model.label
-//                                 anchors.bottom: parent.top; anchors.bottomMargin: 2
-//                                 color: "black"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
-// }
-// )qml";
 const char* QML_SRC = R"qml(
 import QtQuick
 import QtQuick.Controls
@@ -397,11 +170,15 @@ import QtLocation
 import QtPositioning
 
 ApplicationWindow {
+    id: mainWindow
     title: "HARP Mission Planner"
     visible: true
     width: 1250
     height: 700
     color: "#1e1e1e"
+
+    // Stores the coordinate where the user clicks for the T-Point
+    property var customTCoord: null
 
     ListModel {
         id: windModel
@@ -450,19 +227,8 @@ ApplicationWindow {
         }
         harpPolygon.path = path;
 
-        var centerCoord = QtPositioning.coordinate(preview.centerLat, preview.centerLon);
-        harpMarker.coordinate = centerCoord;
-        lzMarker.coordinate = QtPositioning.coordinate(Number(i_lat.text), Number(i_lon.text));
-
-        tPointsModel.clear();
-        var linePath = [centerCoord];
-        for (var j = 0; j < preview.tPoints.length; j++) {
-            tPointsModel.append({ "lat": preview.tPoints[j].lat, "lon": preview.tPoints[j].lon, "label": preview.tPoints[j].label });
-            linePath.push(QtPositioning.coordinate(preview.tPoints[j].lat, preview.tPoints[j].lon));
-        }
-        runInLine.path = linePath;
-
-        map.center = centerCoord;
+        harpMarker.coordinate = QtPositioning.coordinate(preview.centerLat, preview.centerLon);
+        harpMarker.visible = true;
     }
 
     SplitView {
@@ -543,49 +309,118 @@ ApplicationWindow {
 
                 plugin: Plugin {
                     name: "osm"
-                    // Bypass Qt redirect server and authenticate with OSM server
                     PluginParameter { name: "osm.mapping.providersrepository.disabled"; value: "true" }
                     PluginParameter { name: "osm.useragent"; value: "HARPMissionPlanner_1_0" }
+                    PluginParameter { name: "osm.mapping.offline.directory"; value: "offline_tiles" }
                 }
 
                 Component.onCompleted: {
-                    if (supportedMapTypes.length > 0) {
-                        activeMapType = supportedMapTypes[0];
+                    if (supportedMapTypes.length > 0) activeMapType = supportedMapTypes[0];
+                    map.center = QtPositioning.coordinate(Number(i_lat.text), Number(i_lon.text));
+                }
+
+                zoomLevel: 11
+
+                // 1. Qt6 Map Panning Handler
+                DragHandler {
+                    id: drag
+                    target: null
+                    property point lastPosition
+                    onActiveChanged: {
+                        if (active) lastPosition = drag.centroid.position
+                    }
+                    onCentroidChanged: {
+                        if (active) {
+                            var dx = centroid.position.x - lastPosition.x
+                            var dy = centroid.position.y - lastPosition.y
+                            map.pan(-dx, -dy)
+                            lastPosition = centroid.position
+                        }
                     }
                 }
 
-                center: QtPositioning.coordinate(29.503121, 78.006743)
-                zoomLevel: 11
+                // 2. Qt6 Map Zooming Handler
+                WheelHandler {
+                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                    onWheel: (event) => {
+                        map.zoomLevel += (event.angleDelta.y / 120.0)
+                    }
+                }
 
-                MapPolygon { id: harpPolygon; color: "#4000FF00"; border.color: "green"; border.width: 2 }
-                MapPolyline { id: runInLine; line.color: "red"; line.width: 2 }
+                // 3. Qt6 Tap to place custom T-Point
+                TapHandler {
+                    acceptedButtons: Qt.LeftButton
+                    onTapped: (eventPoint) => {
+                        mainWindow.customTCoord = map.toCoordinate(eventPoint.position);
+                    }
+                }
+
+                // --- MAP OVERLAYS ---
+
+                MapPolygon {
+                    id: harpPolygon
+                    color: "#4000FF00"; border.color: "green"; border.width: 2
+                }
 
                 MapQuickItem {
                     id: lzMarker
-                    anchorPoint.x: lzIcon.width / 2; anchorPoint.y: lzIcon.height / 2
-                    sourceItem: Rectangle {
-                        id: lzIcon; width: 14; height: 14; radius: 7; color: "blue"; border.color: "white"; border.width: 2
-                        Text { text: "LZ"; anchors.bottom: parent.top; color: "blue"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
+                    // Automatically updates if you change the LZ lat/lon text fields
+                    coordinate: QtPositioning.coordinate(Number(i_lat.text), Number(i_lon.text))
+                    anchorPoint.x: 7; anchorPoint.y: 7
+                    sourceItem: Item {
+                        width: 14; height: 14
+                        Rectangle { anchors.fill: parent; radius: 7; color: "blue"; border.color: "white"; border.width: 2 }
+                        Text {
+                            text: "LZ"
+                            anchors.left: parent.right; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter
+                            color: "blue"; font.bold: true; font.pixelSize: 14; style: Text.Outline; styleColor: "white"
+                        }
                     }
                 }
 
                 MapQuickItem {
                     id: harpMarker
-                    anchorPoint.x: harpIcon.width / 2; anchorPoint.y: harpIcon.height / 2
-                    sourceItem: Rectangle {
-                        id: harpIcon; width: 14; height: 14; radius: 7; color: "red"; border.color: "white"; border.width: 2
-                        Text { text: "HARP"; anchors.bottom: parent.top; color: "red"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
+                    visible: false // Hidden until "Preview" is clicked
+                    anchorPoint.x: 7; anchorPoint.y: 7
+                    sourceItem: Item {
+                        width: 14; height: 14
+                        Rectangle { anchors.fill: parent; radius: 7; color: "red"; border.color: "white"; border.width: 2 }
+                        Text {
+                            text: "HARP"
+                            anchors.left: parent.right; anchors.leftMargin: 6; anchors.verticalCenter: parent.verticalCenter
+                            color: "red"; font.bold: true; font.pixelSize: 14; style: Text.Outline; styleColor: "white"
+                        }
                     }
                 }
 
-                MapItemView {
-                    model: ListModel { id: tPointsModel }
-                    delegate: MapQuickItem {
-                        coordinate: QtPositioning.coordinate(model.lat, model.lon)
-                        anchorPoint.x: 6; anchorPoint.y: 6
-                        sourceItem: Rectangle {
-                            width: 12; height: 12; radius: 6; color: "orange"; border.color: "white"; border.width: 2
-                            Text { text: model.label; anchors.bottom: parent.top; anchors.bottomMargin: 2; color: "black"; font.bold: true; anchors.horizontalCenter: parent.horizontalCenter }
+                MapQuickItem {
+                    id: customTMarker
+                    coordinate: mainWindow.customTCoord ? mainWindow.customTCoord : QtPositioning.coordinate(0, 0)
+                    visible: mainWindow.customTCoord !== null
+
+                    // Anchor exactly at the center of the T-crossbar (x: 15, y: 2)
+                    anchorPoint.x: 15
+                    anchorPoint.y: 2
+
+                    sourceItem: Item {
+                        width: 30; height: 30
+
+                        Item {
+                            anchors.fill: parent
+                            // Rotate only the lines around the crossbar center
+                            transform: Rotation { origin.x: 15; origin.y: 2; angle: Number(i_airh.text) }
+
+                            // Crossbar
+                            Rectangle { x: 0; y: 0; width: 30; height: 4; color: "red" }
+                            // Stem
+                            Rectangle { x: 13; y: 0; width: 4; height: 25; color: "red" }
+                        }
+
+                        // Label stays upright
+                        Text {
+                            text: "T-Point"
+                            x: 18; y: 8
+                            color: "black"; font.bold: true; font.pixelSize: 14; style: Text.Outline; styleColor: "white"
                         }
                     }
                 }
