@@ -1,0 +1,11 @@
+<Placemark>
+    <name>Heading %1°</name>
+    <LineString>
+<!--        <extrude>1</extrude>-->
+        <tessellate>1</tessellate>
+        <altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>
+            %2
+        </coordinates>
+    </LineString>
+</Placemark>

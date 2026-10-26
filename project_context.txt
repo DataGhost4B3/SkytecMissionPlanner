@@ -1,0 +1,4416 @@
+=== ./CMakeLists.txt ===
+cmake_minimum_required(VERSION 3.28)
+project(MP LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+
+find_package(GDAL REQUIRED)
+find_package(PROJ REQUIRED)
+find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Quick Qml Concurrent Widgets)
+qt_standard_project_setup()
+
+#add_executable(MP main.cpp)
+qt_add_executable(MP main.cpp)
+set_target_properties(MP PROPERTIES OUTPUT_NAME "MissionPlanner")
+
+#qt_add_qml_module(MP
+#        URI MP
+#        VERSION 1.0
+#        RESOURCE_PREFIX "/qt/qml"
+#        QML_FILES
+#            "${CMAKE_CURRENT_SOURCE_DIR}/Main.qml"
+#)
+
+add_subdirectory(engine)
+add_subdirectory(powertrain)
+add_subdirectory(handle)
+add_subdirectory(ui)
+
+target_link_libraries(MP PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Quick
+        Qt6::Qml
+        Qt6::Concurrent
+        Qt6::Widgets
+        GDAL::GDAL
+        MissionControl       # <-- Link handle library here too
+        MissionControlplugin # <-- Link handle QML plugin here too
+        MainUI
+        MainUIplugin
+)
+
+#qt_add_qml_module(MP
+#        URI ui
+#        VERSION 1.0
+#        RESOURCE_PREFIX "/qt/qml"
+#        QML_FILES
+#            ui/Main.qml
+#            ui/MainForm.ui.qml
+#)
+=== ./engine/CMakeLists.txt ===
+add_library(Engine STATIC
+        points.cpp
+        points.hpp
+        engine.cpp
+        engine.hpp
+)
+
+target_include_directories(Engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(Engine PRIVATE Powertrain)
+=== ./engine/engine.cpp ===
+#include "engine.hpp"
+#include <cmath>
+#include <numbers>
+#include <algorithm>
+
+constexpr double EARTH_RADIUS = 6378137.0;
+constexpr double DEG_TO_RAD = std::numbers::pi / 180.0;
+constexpr double RAD_TO_DEG = 180.0 / std::numbers::pi;
+constexpr double FT_TO_M = 0.3048;
+constexpr double M_TO_FT = 1.0 / 0.3048;
+constexpr double KTS_TO_MS = 0.514444;
+
+// Altitude-based wind interpolation (Altitude in Feet, Speed in m/s)
+static std::pair<double, double> interpolate_alt(const std::map<double, std::pair<double, double>>& wind, double alt_ft, double lz_alt_ft) {
+    if (alt_ft <= lz_alt_ft || wind.empty()) return {0.0, 0.0};
+
+    auto upper_it = wind.upper_bound(alt_ft);
+    if (upper_it == wind.end()) return std::prev(wind.end())->second;
+
+    double alt1, S1, D1;
+    if (upper_it == wind.begin()) {
+        alt1 = lz_alt_ft; S1 = 0.0; D1 = 0.0;
+    } else {
+        auto lower_it = std::prev(upper_it);
+        alt1 = lower_it->first; S1 = lower_it->second.first; D1 = lower_it->second.second;
+    }
+
+    double alt2 = upper_it->first; double S2 = upper_it->second.first; double D2 = upper_it->second.second;
+
+    double U1 = -S1 * std::sin(D1 * DEG_TO_RAD); double V1 = -S1 * std::cos(D1 * DEG_TO_RAD);
+    double U2 = -S2 * std::sin(D2 * DEG_TO_RAD); double V2 = -S2 * std::cos(D2 * DEG_TO_RAD);
+
+    double t = (alt_ft - alt1) / (alt2 - alt1);
+    double U = U1 + t * (U2 - U1); double V = V1 + t * (V2 - V1);
+
+    double S = std::sqrt(U * U + V * V);
+    double D = std::atan2(-U, -V) * RAD_TO_DEG;
+    D = std::fmod(D, 360.0);
+    if (D < 0.0) D += 360.0;
+
+    return {S, D};
+}
+
+// Temporary struct for the relative Cartesian shifting
+struct RelPoint { double x, y, alt; };
+
+void run_physics(
+    std::array<std::vector<geo_point>, 360>& path_list,
+    const std::unordered_map<std::string, double>& params,
+    const std::map<double, std::pair<double, double>>& wind
+) {
+    double LZ_LAT = params.at("LZ LAT");
+    double LZ_LON = params.at("LZ LON");
+    double lz_alt_m = params.at("LZ ELEV"); // Assuming UI provides meters
+
+    double jump_alt_m = params.at("JUMP ALT") * FT_TO_M;
+    double open_alt_m = params.at("OPEN ALT") * FT_TO_M;
+
+    double airv_ms = params.at("AC VEL KTS") * KTS_TO_MS;
+    double airh_deg = params.at("AC HDG DEG");
+
+    double canopy_v_ms = params.at("0-WIND CANOPY VEL") * KTS_TO_MS;
+    double gr = params.at("GR");
+    if (gr <= 0) gr = 1.0;
+    double descv_ms = canopy_v_ms / gr;
+
+    double vz_ff_ms = 45.0; // Freefall vertical velocity (m/s)
+    double dz = 5.0;        // 5-meter integration steps
+
+    // Master Cartesian Coordinate definition: +X is East, +Y is North
+    double ac_vx = airv_ms * std::sin(airh_deg * DEG_TO_RAD);
+    double ac_vy = airv_ms * std::cos(airh_deg * DEG_TO_RAD);
+
+    // --- PHASE 1: Freefall Trajectory (Jump -> Open) ---
+    // Start directly over the LZ (0,0)
+    std::vector<RelPoint> freefall_path;
+    double cx = 0.0, cy = 0.0;
+    freefall_path.push_back({cx, cy, jump_alt_m});
+
+    for (double alt = jump_alt_m; alt > open_alt_m; alt -= dz) {
+        auto [w_ms, w_deg] = interpolate_alt(wind, alt * M_TO_FT, lz_alt_m * M_TO_FT);
+
+        // Meteorological wind points 'to' opposite direction
+        double wind_vx = -w_ms * std::sin(w_deg * DEG_TO_RAD);
+        double wind_vy = -w_ms * std::cos(w_deg * DEG_TO_RAD);
+
+        cx += (wind_vx + ac_vx) * (dz / vz_ff_ms);
+        cy += (wind_vy + ac_vy) * (dz / vz_ff_ms);
+
+        ac_vx *= 0.95; ac_vy *= 0.95; // Decay aircraft momentum
+
+        double next_alt = std::max(alt - dz, open_alt_m);
+        freefall_path.push_back({cx, cy, next_alt});
+    }
+
+    double ff_end_x = cx;
+    double ff_end_y = cy;
+
+    // --- PHASE 2: Canopy Trajectory (Open -> LZ) & Parallel Shift ---
+    for (int i = 0; i < 360; ++i) {
+        path_list[i].clear();
+
+        std::vector<RelPoint> canopy_path;
+        double px = ff_end_x;
+        double py = ff_end_y;
+        double h_rad = i * DEG_TO_RAD;
+
+        // Calculate the forward canopy path for this specific heading
+        for (double alt = open_alt_m; alt > lz_alt_m; alt -= dz) {
+            auto [w_ms, w_deg] = interpolate_alt(wind, alt * M_TO_FT, lz_alt_m * M_TO_FT);
+
+            double wind_vx = -w_ms * std::sin(w_deg * DEG_TO_RAD);
+            double wind_vy = -w_ms * std::cos(w_deg * DEG_TO_RAD);
+
+            double glide_vx = canopy_v_ms * std::sin(h_rad);
+            double glide_vy = canopy_v_ms * std::cos(h_rad);
+
+            px += (wind_vx + glide_vx) * (dz / descv_ms);
+            py += (wind_vy + glide_vy) * (dz / descv_ms);
+
+            double next_alt = std::max(alt - dz, lz_alt_m);
+            canopy_path.push_back({px, py, next_alt});
+        }
+
+        // --- PHASE 3: The Parallel Shift ---
+        // (px, py) is where we landed. We want the landing to be exactly at the LZ (0,0).
+        // Therefore, the whole trajectory needs to be shifted by (-px, -py).
+        double shift_x = -px;
+        double shift_y = -py;
+
+        // Map the shifted Cartesian coords to true Lat/Lon
+        // A. Shift and map Freefall leg
+        for (const auto& pt : freefall_path) {
+            double sx = pt.x + shift_x;
+            double sy = pt.y + shift_y;
+
+            double lat = LZ_LAT + (sy / EARTH_RADIUS) * RAD_TO_DEG;
+            double lon = LZ_LON + (sx / (EARTH_RADIUS * std::cos(lat * DEG_TO_RAD))) * RAD_TO_DEG;
+            path_list[i].push_back(geo_point{lat, lon, pt.alt});
+        }
+
+        // B. Shift and map Canopy leg
+        for (const auto& pt : canopy_path) {
+            double sx = pt.x + shift_x;
+            double sy = pt.y + shift_y;
+
+            double lat = LZ_LAT + (sy / EARTH_RADIUS) * RAD_TO_DEG;
+            double lon = LZ_LON + (sx / (EARTH_RADIUS * std::cos(lat * DEG_TO_RAD))) * RAD_TO_DEG;
+            path_list[i].push_back(geo_point{lat, lon, pt.alt});
+        }
+    }
+}
+=== ./engine/engine.hpp ===
+#pragma once
+
+#include <unordered_map>
+#include <map>
+#include <array>
+#include <vector>
+#include <string>
+#include <utility>
+#include "points.hpp"
+
+void run_physics(
+    std::array<std::vector<geo_point>, 360>& path_list,
+    const std::unordered_map<std::string, double>& params,
+    // const std::unordered_map<double, std::pair<double, double>>& wind
+    const std::map<double, std::pair<double, double>>& wind
+    );
+=== ./engine/points.cpp ===
+#include "points.hpp"
+#include <cmath>
+#include <numbers>
+
+inline constexpr double R0 = 6356766; // meters; 45 32 33 latitude
+inline constexpr double PI = std::numbers::pi;
+inline constexpr double DEG_TO_RAD = std::numbers::pi / 180.0;
+inline constexpr double RAD_TO_DEG = 180.0 / std::numbers::pi;
+
+// geo_point -> cartesian_point definition
+geo_point::operator cartesian_point() const {
+    cartesian_point p;
+    const double rad_lat = lat * DEG_TO_RAD;
+    const double rad_lon = lon * DEG_TO_RAD;
+    const double r = R0 + alt;
+
+    p.x = r * std::cos(rad_lat) * std::cos(rad_lon);
+    p.y = r * std::cos(rad_lat) * std::sin(rad_lon);
+    p.z = r * std::sin(rad_lat);
+    return p;
+}
+
+// cartesian_point -> geo_point definition
+cartesian_point::operator geo_point() const {
+    geo_point gp;
+    double r = std::sqrt(x * x + y * y);
+    gp.lon = std::atan2(y, x) * RAD_TO_DEG;
+    gp.lat = std::atan2(z, r) * RAD_TO_DEG;
+    gp.alt = r - R0;
+    return gp;
+}
+
+=== ./engine/points.hpp ===
+#pragma once
+
+struct cartesian_point;
+
+struct geo_point {
+    double lat, lon, alt;
+
+    explicit operator cartesian_point() const;
+};
+
+struct cartesian_point {
+    double x, y, z;
+    cartesian_point operator+(const cartesian_point &p) const {
+        return {x+p.x, y+p.y, z+p.z};
+    };
+    cartesian_point operator-(const cartesian_point &p) const {
+        return {x-p.x, y-p.y, z-p.z};
+    }
+
+    explicit operator geo_point() const;
+};
+=== ./handle/CMakeLists.txt ===
+# handle/CMakeLists.txt
+
+# 1. Change to qt_add_library
+qt_add_library(MissionControl STATIC)
+
+# 2. Add the qml module definition
+qt_add_qml_module(MissionControl
+        URI handle
+        VERSION 1.0
+        RESOURCE_PREFIX "/qt/qml"
+        SOURCES
+            missioncontrol.cpp
+            missioncontrol.hpp
+        RESOURCES
+            kml_document.xml
+            kml_placemark.xml
+)
+
+target_include_directories(MissionControl PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(MissionControl PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Qml
+        Qt6::Quick
+        Qt6::Concurrent
+        Powertrain
+)
+
+=== ./handle/kml_document.xml ===
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+    <Document>
+        <name>Skytec Mission Trajectories</name>
+        <description>Exported 360-degree trajectory envelope.</description>
+        %1
+    </Document>
+</kml>
+=== ./handle/kml_placemark.xml ===
+<Placemark>
+    <name>Heading %1°</name>
+    <LineString>
+<!--        <extrude>1</extrude>-->
+        <tessellate>1</tessellate>
+        <altitudeMode>relativeToGround</altitudeMode>
+        <coordinates>
+            %2
+        </coordinates>
+    </LineString>
+</Placemark>
+=== ./handle/missioncontrol.cpp ===
+#include "missioncontrol.hpp"
+#include "powertrain.hpp" // Access the global params map
+#include "engine.hpp"         // Access run_physics
+#include <QDebug>
+#include <QVariant>
+#include <QFile>
+#include <QTextStream>
+#include <QUrl>
+#include <QDateTime>
+#include <QtConcurrent>
+#include <cmath>
+
+// ADD THESE:
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QDir>
+
+MissionController::MissionController(QObject *parent) : QObject(parent) {}
+
+// void MissionController::runMission(const QVariantMap& missionData) {
+//     // 1. Clear previous mission data
+//     params.clear();
+//     wind.clear(); // ADD THIS to reset the wind hashmap
+//
+//     // 2. Extract QML data into the C++ hashmap
+//     params["LZ LAT"] = missionData["lzLat"].toDouble();
+//     params["LZ LON"] = missionData["lzLon"].toDouble();
+//     params["LZ ELEV"] = missionData["lzElev"].toDouble();
+//     params["JUMP ALT"] = missionData["jumpAlt"].toDouble();
+//     params["OPEN ALT"] = missionData["openAlt"].toDouble(); // Wait for missing UI ID
+//     params["WT KG"] = missionData["weight"].toDouble();
+//     params["AC VEL KTS"] = missionData["acVel"].toDouble();
+//     params["AC HDG DEG"] = missionData["acHdg"].toDouble();
+//     params["0-WIND CANOPY VEL"] = missionData["canopyVel"].toDouble();
+//     params["GR"] = missionData["glideRatio"].toDouble();
+//
+//     // 3. Extract the manual QML table edits into the C++ wind hashmap
+//     QVariantList windList = missionData["windProfile"].toList();
+//     for (const QVariant& vRow : windList) {
+//         QVariantMap row = vRow.toMap();
+//         double alt = row["altitude"].toDouble();
+//         double spd = row["speed"].toDouble();
+//         double hdg = row["heading"].toDouble();
+//
+//         // Populate the global wind hashmap that powertrain uses
+//         wind[alt] = std::make_pair(spd, hdg);
+//     }
+//
+//     qDebug() << "Mission Parameters Loaded:" << params["LZ LAT"] << params["LZ LON"];
+//
+//     // 3. Trigger the physics engine
+//     run_physics(path_lists, params, wind);
+//
+//     // Extract the very top Jump Points (Aircraft Release points) to draw the locus
+//     QVariantList perimeter;
+//     for (int i = 0; i < 360; ++i) {
+//         if (!path_lists[i].empty()) {
+//             QVariantMap pt;
+//             pt["lat"] = path_lists[i][0].lat; // Index 0 is the exact jump point
+//             pt["lon"] = path_lists[i][0].lon;
+//             perimeter.append(pt);
+//         }
+//     }
+//
+//     emit envelopeCalculated(perimeter);
+// }
+void MissionController::runMission(const QVariantMap& missionData) {
+    params.clear();
+    wind.clear();
+
+    params["LZ LAT"] = missionData["lzLat"].toDouble();
+    params["LZ LON"] = missionData["lzLon"].toDouble();
+    params["LZ ELEV"] = missionData["lzElev"].toDouble();
+    params["JUMP ALT"] = missionData["jumpAlt"].toDouble();
+    params["OPEN ALT"] = missionData["openAlt"].toDouble(); // CRITICAL: Ensure this is uncommented
+    params["WT KG"] = missionData["weight"].toDouble();
+    params["AC VEL KTS"] = missionData["acVel"].toDouble();
+    params["AC HDG DEG"] = missionData["acHdg"].toDouble();
+    params["0-WIND CANOPY VEL"] = missionData["canopyVel"].toDouble();
+    params["GR"] = missionData["glideRatio"].toDouble();
+
+    QVariantList windList = missionData["windProfile"].toList();
+    for (const QVariant& vRow : windList) {
+        QVariantMap row = vRow.toMap();
+        double alt = row["altitude"].toDouble();
+        double spd = row["speed"].toDouble();
+        double hdg = row["heading"].toDouble();
+        wind[alt] = std::make_pair(spd, hdg);
+    }
+
+    run_physics(path_lists, params, wind);
+
+    // Extract the VERY TOP Jump Point (Aircraft Release point) to draw the locus
+    QVariantList perimeter;
+    for (int i = 0; i < 360; ++i) {
+        if (!path_lists[i].empty()) {
+            QVariantMap pt;
+            pt["lat"] = path_lists[i][0].lat; // <--- Index 0 is the start of the parallel-shifted path
+            pt["lon"] = path_lists[i][0].lon;
+            perimeter.append(pt);
+        }
+    }
+
+    emit envelopeCalculated(perimeter);
+}
+
+void MissionController::exportKml(const QString& filePath) {
+    qDebug() << "KML Export triggered for:" << filePath;
+    // TODO: Iterate through path_lists and generate KML XML structure
+    QString localPath = QUrl(filePath).toLocalFile();
+    if (localPath.isEmpty()) {
+        localPath = filePath;
+    }
+
+    // 1. Load the external XML templates from the Qt Resource System
+    QFile docFile(":/qt/qml/handle/kml_document.xml");
+    QFile placemarkFile(":/qt/qml/handle/kml_placemark.xml");
+
+    if (!docFile.open(QIODevice::ReadOnly | QIODevice::Text) ||
+        !placemarkFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Failed to load external KML XML templates.";
+        return;
+        }
+
+    QString docTemplate = QTextStream(&docFile).readAll();
+    QString placemarkTemplate = QTextStream(&placemarkFile).readAll();
+
+    docFile.close();
+    placemarkFile.close();
+
+    // 2. Generate the internal Placemarks
+    QString allPlacemarks;
+    for (int i = 0; i < 360; ++i) {
+        if (path_lists[i].empty()) continue;
+
+        QString coordinates;
+        for (const auto& pt : path_lists[i]) {
+            // Build the coordinate block with strict spacing for clean XML output
+            coordinates += QString("          %1,%2,%3\n")
+                               .arg(pt.lon, 0, 'f', 6)
+                               .arg(pt.lat, 0, 'f', 6)
+                               .arg(pt.alt, 0, 'f', 2);
+        }
+
+        // Inject the heading (i) and coordinate list into the Placemark template
+        allPlacemarks += placemarkTemplate.arg(i).arg(coordinates);
+    }
+
+    // 3. Inject all Placemarks into the main Document template
+    QString finalKml = docTemplate.arg(allPlacemarks);
+
+    // 4. Write the assembled KML to the user's hard drive
+    QFile outFile(localPath);
+    if (outFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream out(&outFile);
+        out << finalKml;
+        outFile.close();
+        qDebug() << "Successfully exported KML to:" << localPath;
+    } else {
+        qWarning() << "Could not open file for KML export:" << localPath;
+    }
+}
+
+void MissionController::fetchWindProfile(double lat, double lon, const QString& date, const QString& time) {
+    emit progressUpdated("Fetching Atmospheric Data...", 0.3);
+
+    QtConcurrent::run([this, lat, lon, date, time]() {
+        try {
+            // 1. Generate current UTC date and exact hour for the API query
+            // QDateTime now = QDateTime::currentDateTimeUtc();
+            // QString date = now.toString("yyyy-MM-dd");
+            // QString time = now.toString("HH:00");
+
+            // 2. Execute your fetchwind.cpp HTTP request
+            WindMap rawWind = fetchWind(lat, lon, date.toStdString(), time.toStdString());
+
+            // 3. Clear the global powertrain hashmap to receive the new data
+            wind.clear();
+            QVariantList tableData;
+
+            // 4. Convert Pressure (hPa) to Standard Altitude (Feet)
+            for (const auto& [pressure, windData] : rawWind) {
+                double speed = windData.first;
+                double direction = windData.second;
+
+                // Standard Barometric Formula: h = 145366.45 * (1 - (P / 1013.25)^0.190284)
+                double altFeet = 145366.45 * (1.0 - std::pow(pressure / 1013.25, 0.190284));
+                double roundedAlt = std::round(altFeet / 100.0) * 100.0; // Round to nearest 100ft
+
+                // Populate the C++ Physics Hashmap
+                wind[roundedAlt] = windData;
+
+                // Populate the QML UI Row
+                QVariantMap row;
+                row["altitude"] = QString::number(roundedAlt, 'f', 0);
+                row["speed"] = QString::number(speed, 'f', 1);
+                row["heading"] = QString::number(direction, 'f', 0);
+                tableData.append(row);
+            }
+
+            // 5. Sort the QML table data descending (Highest altitude at the top of the table)
+            std::sort(tableData.begin(), tableData.end(), [](const QVariant& a, const QVariant& b) {
+                return a.toMap()["altitude"].toDouble() > b.toMap()["altitude"].toDouble();
+            });
+
+            // 6. Push the updated data back to the QML Main Thread
+            QMetaObject::invokeMethod(this, [this, tableData]() {
+                emit windProfileFetched(tableData);
+                emit progressUpdated("Wind Profile Downloaded", 1.0);
+            }, Qt::QueuedConnection);
+
+        } catch (const std::exception& e) {
+            QMetaObject::invokeMethod(this, [this, e]() {
+                emit errorReported(QString("Wind API Error: ") + e.what());
+                emit progressUpdated("Failed", 1.0);
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+// --- PROJECT SERIALIZATION ---
+void MissionController::saveProject(const QString& filePath, const QVariantMap& projectData) {
+    QString localPath = QUrl(filePath).toLocalFile();
+    if (localPath.isEmpty()) localPath = filePath;
+
+    QFile file(localPath);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        // Automatically converts the QML dictionary to a formatted JSON file
+        QJsonDocument doc(QJsonObject::fromVariantMap(projectData));
+        file.write(doc.toJson());
+        file.close();
+        qDebug() << "Project saved to:" << localPath;
+    } else {
+        emit errorReported("Failed to save project file.");
+    }
+}
+
+QVariantMap MissionController::loadProject(const QString& filePath) {
+    QString localPath = QUrl(filePath).toLocalFile();
+    if (localPath.isEmpty()) localPath = filePath;
+
+    QFile file(localPath);
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+        file.close();
+        return doc.object().toVariantMap(); // Returns JSON as a QML dictionary
+    }
+    emit errorReported("Failed to open project file.");
+    return QVariantMap();
+}
+
+// --- SETTINGS MANAGEMENT ---
+QString MissionController::getCachePath() {
+    QSettings settings("Skytec", "MissionPlanner");
+    // Defaults to OS AppData/map_cache if a user hasn't set one yet
+    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/map_cache";
+    return settings.value("cachePath", defaultPath).toString();
+}
+
+void MissionController::setCachePath(const QString& path) {
+    QString localPath = QUrl(path).toLocalFile();
+    if (localPath.isEmpty()) localPath = path;
+
+    QSettings settings("Skytec", "MissionPlanner");
+    settings.setValue("cachePath", localPath);
+
+    // Ensure the new directory physically exists
+    QDir().mkpath(localPath);
+}
+=== ./handle/missioncontrol.hpp ===
+#pragma once
+#include <QObject>
+#include <QVariantMap>
+#include <QtQml/qqmlregistration.h>
+
+class MissionController : public QObject {
+    Q_OBJECT
+    QML_ELEMENT
+    QML_SINGLETON // Allows QML to call it without instantiating it
+
+public:
+    explicit MissionController(QObject *parent = nullptr);
+
+    // Receives a JSON-like object from QML
+    Q_INVOKABLE void runMission(const QVariantMap& missionData);
+    Q_INVOKABLE void exportKml(const QString& filePath);
+
+    // ADD THIS: Bridges the Wind Panel to the fetchwind.cpp logic
+    // Q_INVOKABLE void fetchWindProfile(double lat, double lon);
+    Q_INVOKABLE void fetchWindProfile(double lat, double lon, const QString& date, const QString& time);
+
+    Q_INVOKABLE void saveProject(const QString& filePath, const QVariantMap& projectData);
+    Q_INVOKABLE QVariantMap loadProject(const QString& filePath);
+    Q_INVOKABLE QString getCachePath();
+    Q_INVOKABLE void setCachePath(const QString& path);
+signals:
+    void envelopeCalculated(QVariantList perimeterPoints);
+    void progressUpdated(QString taskName, double percent); // Ensure these exist
+    // ADD THIS: Sends the formatted table data back to QML
+    void windProfileFetched(QVariantList windData);
+    void errorReported(QString errorMessage);
+};
+=== ./main.cpp ===
+// #include <QGuiApplication>
+#include <QApplication>
+#include <QQmlApplicationEngine>
+#include <QCoreApplication>
+#include <QDirIterator>
+#include <QDebug>
+#include <QtGlobal> // Required for OS macros
+
+int main(int argc, char *argv[]) {
+#ifdef Q_OS_LINUX
+    // qputenv("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+    // qputenv("XDG_CURRENT_DESKTOP", "KDE");
+    // qputenv("QT_QPA_PLATFORMTHEME", "kde");
+    qputenv("QT_QPA_PLATFORMTHEME", "gtk3");
+#endif
+
+    QApplication app(argc, argv);
+
+    QCoreApplication::setOrganizationName("Skytec Solutions Pvt. Ltd.");
+    QCoreApplication::setApplicationName("MP");
+
+    // Place this in your main.cpp
+    QDirIterator it(":", QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        qDebug() << it.next();
+    }
+
+    QQmlApplicationEngine engine;
+
+    // Tell the engine where QML modules are located in the resource system
+    engine.addImportPath(QStringLiteral("qrc:/qt/qml"));
+
+    QObject::connect(
+        &engine,
+        &QQmlApplicationEngine::objectCreationFailed,
+        &app,
+        []() {
+            QCoreApplication::exit(-1);
+        },
+        Qt::QueuedConnection
+        );
+
+    const QUrl url(QStringLiteral("qrc:/qt/qml/ui/Main.qml"));
+    engine.load(url);
+
+    return app.exec();
+}
+=== ./powertrain/CMakeLists.txt ===
+add_library(Powertrain STATIC
+        powertrain.cpp
+        powertrain.hpp
+        fetchwind.cpp
+        fetchwind.hpp
+)
+
+target_include_directories(Powertrain PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+target_link_libraries(Powertrain PUBLIC
+        Engine
+#        Qt6::Core
+#        Qt6::Qml
+        CURL::libcurl
+        nlohmann_json::nlohmann_json
+)
+=== ./powertrain/fetchwind.cpp ===
+#include "fetchwind.hpp"
+
+size_t writeCallback(
+    void* contents,
+    size_t size,
+    size_t nmemb,
+    void* userdata
+    ) {
+    const size_t bytes = size * nmemb;
+    auto* response = static_cast<std::string*>(userdata);
+    response->append(
+        static_cast<char*>(contents),
+        bytes
+        );
+    return bytes;
+}
+
+std::string buildHourlyVariables() {
+    std::string hourly;
+
+    for (int pressure : pressure_levels) {
+        if (!hourly.empty()) {
+            hourly += ",";
+        }
+
+        hourly +=
+            "wind_speed_" +
+            std::to_string(pressure) +
+            "hPa";
+
+        hourly +=
+            ",wind_direction_" +
+            std::to_string(pressure) +
+            "hPa";
+    }
+
+    return hourly;
+}
+
+std::string buildURL(
+            double latitude,
+            double longitude
+        ) {
+    return
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=" + std::to_string(latitude) +
+        "&longitude=" + std::to_string(longitude) +
+        "&hourly=" + buildHourlyVariables() +
+        "&wind_speed_unit=ms"
+        "&timezone=GMT"
+        "&forecast_days=16";
+}
+
+std::string httpGet(const std::string& url) {
+            // Initialize libcurl once for this process.
+            static const CURLcode initResult =
+                curl_global_init(CURL_GLOBAL_DEFAULT);
+
+            if (initResult != CURLE_OK) {
+                throw std::runtime_error(
+                    "Failed to initialize libcurl"
+                );
+            }
+
+            CURL* curl = curl_easy_init();
+
+            if (!curl) {
+                throw std::runtime_error(
+                    "Failed to create CURL handle"
+                );
+            }
+
+            std::string response;
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_URL,
+                url.c_str()
+            );
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_WRITEFUNCTION,
+                writeCallback
+            );
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_WRITEDATA,
+                &response
+            );
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_CONNECTTIMEOUT,
+                10L
+            );
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_TIMEOUT,
+                30L
+            );
+
+            curl_easy_setopt(
+                curl,
+                CURLOPT_FOLLOWLOCATION,
+                1L
+            );
+
+            const CURLcode result =
+                curl_easy_perform(curl);
+
+            long statusCode = 0;
+
+            curl_easy_getinfo(
+                curl,
+                CURLINFO_RESPONSE_CODE,
+                &statusCode
+            );
+
+            curl_easy_cleanup(curl);
+
+            if (result != CURLE_OK) {
+                throw std::runtime_error(
+                    std::string("HTTP request failed: ") +
+                    curl_easy_strerror(result)
+                );
+            }
+
+            if (statusCode != 200) {
+                throw std::runtime_error(
+                    "Open-Meteo HTTP status " +
+                    std::to_string(statusCode) +
+                    ": " + response
+                );
+            }
+
+            return response;
+        }
+
+WindMap fetchWind(
+        double latitude,
+        double longitude,
+        const std::string& date,
+        const std::string& time
+    ) {
+        if (!std::isfinite(latitude) ||
+            latitude < -90.0 ||
+            latitude > 90.0) {
+            throw std::invalid_argument(
+                "Latitude must be between -90 and 90"
+            );
+        }
+
+        if (!std::isfinite(longitude) ||
+            longitude < -180.0 ||
+            longitude > 180.0) {
+            throw std::invalid_argument(
+                "Longitude must be between -180 and 180"
+            );
+        }
+
+        if (date.size() != 10 ||
+            date[4] != '-' ||
+            date[7] != '-' ||
+            time.size() != 5 ||
+            time[2] != ':') {
+            throw std::invalid_argument(
+                "Expected date YYYY-MM-DD and time HH:MM"
+            );
+        }
+
+        const std::string response = httpGet(
+            buildURL(latitude, longitude)
+        );
+
+        const json data = json::parse(response);
+
+        if (data.value("error", false)) {
+            throw std::runtime_error(
+                data.value(
+                    "reason",
+                    "Open-Meteo API error"
+                )
+            );
+        }
+
+        const auto& hourly = data.at("hourly");
+        const auto& times = hourly.at("time");
+
+        const std::string requestedTimestamp =
+            date + "T" + time;
+
+        size_t timeIndex = times.size();
+
+        for (size_t i = 0; i < times.size(); ++i) {
+            if (times[i].get<std::string>() ==
+                requestedTimestamp) {
+                timeIndex = i;
+                break;
+            }
+        }
+
+        if (timeIndex == times.size()) {
+            throw std::runtime_error(
+                "Timestamp not available in API response: " +
+                requestedTimestamp
+            );
+        }
+
+        WindMap wind;
+
+        for (int pressure : pressure_levels) {
+            const std::string speedKey =
+                "wind_speed_" +
+                std::to_string(pressure) +
+                "hPa";
+
+            const std::string directionKey =
+                "wind_direction_" +
+                std::to_string(pressure) +
+                "hPa";
+
+            const auto& speeds = hourly.at(speedKey);
+            const auto& directions = hourly.at(directionKey);
+
+            if (speeds[timeIndex].is_null() ||
+                directions[timeIndex].is_null()) {
+                continue;
+            }
+
+            const double speed =
+                speeds[timeIndex].get<double>();
+
+            const double direction =
+                directions[timeIndex].get<double>();
+
+            if (!std::isfinite(speed) ||
+                !std::isfinite(direction)) {
+                continue;
+            }
+
+            wind.emplace(
+                static_cast<double>(pressure),
+                std::make_pair(speed, direction)
+            );
+        }
+
+        return wind;
+    }
+=== ./powertrain/fetchwind.hpp ===
+#pragma once
+
+#include <unordered_map>
+#include <map> // Replace <unordered_map>
+#include <utility>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <string>
+
+// using WindMap = std::unordered_map<double, std::pair<double, double>>;
+using WindMap = std::map<double, std::pair<double, double>>;
+using json = nlohmann::json;
+
+constexpr int pressure_levels[] = {
+    1000, 975, 950, 925, 900, 850, 800, 700, 600, 500, 400, 300, 250, 200
+};
+
+size_t writeCallback(
+    void* contents,
+    size_t size,
+    size_t nmemb,
+    void* userdata
+    );
+
+std::string buildHourlyVariables();
+
+std::string buildURL(
+            double latitude,
+            double longitude
+        );
+
+std::string httpGet(const std::string& url);
+
+WindMap fetchWind(
+        double latitude,
+        double longitude,
+        const std::string& date,
+        const std::string& time
+    );
+=== ./powertrain/powertrain.cpp ===
+#include "powertrain.hpp"
+
+// Instantiate the variables in memory exactly once
+std::array<std::vector<geo_point>, 360> path_lists;
+std::unordered_map<std::string, double> params;
+// std::unordered_map<double, std::pair<double, double>> wind;
+std::map<double, std::pair<double, double>> wind;
+=== ./powertrain/powertrain.hpp ===
+#pragma once
+
+#include "points.hpp"
+#include "fetchwind.hpp"
+#include <array>
+#include <string>
+#include <unordered_map>
+#include <map>
+#include <vector>
+
+extern std::array<std::vector<geo_point>, 360> path_lists;
+
+extern std::unordered_map<std::string, double> params;
+/*
+ * LZ LAT
+ * LZ LON
+ * LZ ELEV
+ * JUMP ALT
+ * OPEN ALT
+ * WT KG
+ * AC VEL KTS
+ * AC HDG DEG
+ * GR
+ * 0-WIND CANOPY VEL
+ */
+
+// extern std::unordered_map<double, std::pair<double, double>> wind;
+extern std::map<double, std::pair<double, double>> wind;
+=== ./ui/CMakeLists.txt ===
+
+qt_add_library(MainUI STATIC)
+
+qt_add_qml_module(MainUI
+        URI ui
+        VERSION 1.0
+        RESOURCE_PREFIX "/qt/qml"
+        QML_FILES
+            Main.qml
+            MainForm.ui.qml
+
+            missionpanel/MissionPanel.qml
+            missionpanel/MissionPanelForm.ui.qml
+
+            mapcanvas/MapCanvas.qml
+            mapcanvas/MapCanvasForm.ui.qml
+
+            mappanel/MapPanel.qml
+            mappanel/MapPanelForm.ui.qml
+
+            windpanel/WindPanel.qml
+            windpanel/WindPanelForm.ui.qml
+        SOURCES
+            mapcanvas/mapcanvas.hpp
+            mapcanvas/mapcanvas.cpp
+        RESOURCES
+            mapcanvas/osm_config.xml
+        DEPENDENCIES
+            handle
+)
+
+target_link_libraries(MainUI PRIVATE
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Qml
+        Qt6::Quick
+        Qt6::Concurrent
+        GDAL::GDAL
+        PROJ::proj
+        MissionControl        # <-- Link the C++ symbols
+        MissionControlplugin  # <-- Link the QML registration backing plugin
+)
+
+target_include_directories(MainUI PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/mapcanvas
+)
+=== ./ui/Main.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Dialogs // Required for FileDialog
+// import Qt.labs.platform as Platform
+import handle          // Required to access MissionController
+
+MainForm {
+    id: window
+
+
+    property real dzLat: 0.0
+    property real dzLon: 0.0
+    property bool hasDz: false
+    property bool isDirty: false
+    property bool forceClose: false
+    // --- APPLICATION STATE ---
+    property string currentProjectPath: ""
+    property var pendingCallback: null // Stores the intercepted action
+    // property bool autoRunAfterFetch: false
+
+
+
+    // --- MENU ACTIONS ---
+    actionNew.onTriggered: { currentProjectPath = ""; statusLabel.text = "New project started."; window.isDirty = false} // Reset dirty flag for a blank slate }
+    actionOpen.onTriggered: openProjectDialog.open()
+    actionSave.onTriggered: {
+        if (currentProjectPath === "") saveProjectDialog.open()
+        else saveCurrentProject()
+    }
+    actionSaveAs.onTriggered: saveProjectDialog.open()
+    actionSettings.onTriggered: {
+        cachePathInput.text = MissionController.getCachePath()
+        settingsDialog.open()
+    }
+    actionExit.onTriggered: window.close() //Qt.quit()
+    actionExportKml.onTriggered: kmlFileDialog.open()
+
+    // Intercept the native window closing event (e.g., clicking the red X)
+    onClosing: (close_event) => {
+        if (isDirty && !forceClose) {
+            close_event.accepted = false // Stop the app from closing
+            closeWarningDialog.open()    // Show the prompt instead
+        }
+    }
+
+    // --- APPROACH B: THE SMOOTH INTERCEPT ---
+    function requireSaveThen(callback) {
+        if (currentProjectPath === "") {
+            pendingCallback = callback
+            saveProjectDialog.open() // Prompts save first
+        } else {
+            saveCurrentProject() // Auto-saves background progress
+            callback() // Proceeds with Run or Fetch
+        }
+    }
+
+    // --- JSON SERIALIZATION ASSEMBLERS ---
+    // function buildProjectJson() {
+    //     let windArray = []
+    //     for (let i = 0; i < windModel.count; i++) {
+    //         let r = windModel.get(i)
+    //         windArray.push({"altitude": r.altitude, "speed": r.speed, "heading": r.heading})
+    //     }
+    //
+    //     return {
+    //         "lzLat": latitudeField.text,
+    //         "lzLon": longitudeField.text,
+    //         "date": dateField.text,
+    //         "time": timeField.text,
+    //         "mapCenterLat": centerLatField.text,
+    //         "mapCenterLon": centerLonField.text,
+    //         "mapWidth": viewWidthField.text,
+    //         "windProfile": windArray
+    //     }
+    // }
+    function buildProjectJson() {
+        let windArray = []
+        for (let i = 0; i < windModel.count; i++) {
+            let r = windModel.get(i)
+            windArray.push({"altitude": r.altitude, "speed": r.speed, "heading": r.heading})
+        }
+
+        return {
+            "lzName": lzNameField.text, // <-- ADD THIS
+            "lzLat": latitudeField.text,
+            "lzLon": longitudeField.text,
+            "lzElev": elevationField.text,
+            "date": dateField.text,
+            "time": timeField.text,
+            "mapCenterLat": centerLatField.text,
+            "mapCenterLon": centerLonField.text,
+            "mapWidth": viewWidthField.text,
+            "jumpAlt": jumpAltField.text,
+            "openAlt": canopyAltField.text,
+            "weight": weightField.text,
+            "acVel": airSpeedField.text,
+            "acHdg": airHeadingField.text,
+            "canopyVel": canopyGroundSpeedField.text,
+            "glideRatio": glideRatioField.text,
+            "windProfile": windArray,
+            // ADD THESE THREE:
+            "dzLat": window.dzLat,
+            "dzLon": window.dzLon,
+            "hasDz": window.hasDz
+        }
+    }
+
+    function saveCurrentProject() {
+        MissionController.saveProject(currentProjectPath, buildProjectJson())
+        statusLabel.text = "Project saved."
+        window.isDirty = false // Reset dirty flag
+    }
+
+    // function loadProjectData(data) {
+    //     latitudeField.text = data.lzLat || ""
+    //     longitudeField.text = data.lzLon || ""
+    //     dateField.text = data.date || ""
+    //     timeField.text = data.time || ""
+    //     centerLatField.text = data.mapCenterLat || ""
+    //     centerLonField.text = data.mapCenterLon || ""
+    //     viewWidthField.text = data.mapWidth || ""
+    //
+    //     windModel.clear()
+    //     if (data.windProfile) {
+    //         for (let i = 0; i < data.windProfile.length; i++) {
+    //             windModel.append(data.windProfile[i])
+    //         }
+    //     }
+    //
+    //     // Snap the map to the loaded state
+    //     mapPanel.applyView()
+    // }
+    function loadProjectData(data) {
+        lzNameField.text = data.lzName || "" // <-- ADD THIS
+        latitudeField.text = data.lzLat || ""
+        longitudeField.text = data.lzLon || ""
+        elevationField.text = data.lzElev || ""
+        dateField.text = data.date || ""
+        timeField.text = data.time || ""
+        centerLatField.text = data.mapCenterLat || ""
+        centerLonField.text = data.mapCenterLon || ""
+        viewWidthField.text = data.mapWidth || ""
+        jumpAltField.text = data.jumpAlt || ""
+        canopyAltField.text = data.openAlt || ""
+        weightField.text = data.weight || ""
+        airSpeedField.text = data.acVel || ""
+        airHeadingField.text = data.acHdg || ""
+        canopyGroundSpeedField.text = data.canopyVel || ""
+        glideRatioField.text = data.glideRatio || ""
+
+        windModel.clear()
+        if (data.windProfile) {
+            for (let i = 0; i < data.windProfile.length; i++) {
+                windModel.append(data.windProfile[i])
+            }
+        }
+        mapPanel.applyView()
+        // 1. Load and plot the DZ
+        window.hasDz = data.hasDz || false
+        if (window.hasDz) {
+            window.dzLat = data.dzLat
+            window.dzLon = data.dzLon
+            gdalRenderer.setDzMarker(window.dzLat, window.dzLon, parseFloat(airHeadingField.text) || 0.0)
+        } else {
+            gdalRenderer.clearDzMarker()
+        }
+
+        // 2. Load and plot the LZ instantly upon opening a file
+        let loadedLat = parseFloat(data.lzLat) || 0.0
+        let loadedLon = parseFloat(data.lzLon) || 0.0
+        if (loadedLat !== 0.0 && loadedLon !== 0.0) {
+            gdalRenderer.setLzMarker(loadedLat, loadedLon)
+        }
+
+        window.isDirty = false // Reset dirty flag after a fresh load
+    }
+
+    function executeMission() {
+        window.isDirty = true // Mark as dirty because a new HARP was generated
+
+        // 1. Sync LZ coordinates to the Map Panel and jump the camera
+        centerLatField.text = latitudeField.text
+        centerLonField.text = longitudeField.text
+        if (viewWidthField.text === "") viewWidthField.text = "25"
+        mapPanel.applyView()
+
+        // ADD THIS: Draw the LZ Marker
+        gdalRenderer.setLzMarker(parseFloat(latitudeField.text), parseFloat(longitudeField.text))
+
+        MissionController.runMission(buildProjectJson())
+    }
+
+    // --- DIALOGS ---
+    // FileDialog {
+    //     id: saveProjectDialog
+    //     title: "Save Mission Project"
+    //     fileMode: FileDialog.SaveFile
+    //     nameFilters: ["Skytec Mission (*.skytec)"]
+    //     defaultSuffix: "skytec"
+    //     onAccepted: {
+    //         currentProjectPath = selectedFile.toString()
+    //         saveCurrentProject()
+    //
+    //         // Resume the intercepted action
+    //         if (pendingCallback) {
+    //             pendingCallback()
+    //             pendingCallback = null
+    //         }
+    //     }
+    //     onRejected: pendingCallback = null // Cancel action if they cancel save
+    // }
+    // Platform.FileDialog {
+    //     id: saveProjectDialog
+    //     title: "Save Mission Project"
+    //     fileMode: Platform.FileDialog.SaveFile
+    //     nameFilters: ["Skytec Mission (*.skytec)"]
+    //     defaultSuffix: "skytec"
+    //     onAccepted: {
+    //         currentProjectPath = file.toString()
+    //         saveCurrentProject()
+    //
+    //         // Resume the intercepted action (Run or Fetch Wind)
+    //         if (pendingCallback) {
+    //             pendingCallback()
+    //             pendingCallback = null
+    //         }
+    //     }
+    //     onRejected: pendingCallback = null
+    // }
+    FileDialog {
+        id: saveProjectDialog
+        title: "Save Mission Project"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Skytec Mission (*.skytec)"]
+        defaultSuffix: "skytec"
+        onAccepted: {
+            currentProjectPath = selectedFile.toString()
+            saveCurrentProject()
+
+            if (pendingCallback) {
+                pendingCallback()
+                pendingCallback = null
+            }
+        }
+        onRejected: pendingCallback = null
+    }
+
+    // FileDialog {
+    //     id: openProjectDialog
+    //     title: "Open Mission Project"
+    //     fileMode: FileDialog.OpenFile
+    //     nameFilters: ["Skytec Mission (*.skytec)"]
+    //     onAccepted: {
+    //         currentProjectPath = selectedFile.toString()
+    //         let data = MissionController.loadProject(currentProjectPath)
+    //         loadProjectData(data)
+    //         statusLabel.text = "Project loaded."
+    //     }
+    // }
+    // Platform.FileDialog {
+    //     id: openProjectDialog
+    //     title: "Open Mission Project"
+    //     fileMode: Platform.FileDialog.OpenFile
+    //     nameFilters: ["Skytec Mission (*.skytec)"]
+    //     onAccepted: {
+    //         currentProjectPath = file.toString()
+    //         let data = MissionController.loadProject(currentProjectPath)
+    //         loadProjectData(data)
+    //         statusLabel.text = "Project loaded."
+    //     }
+    // }
+    FileDialog {
+        id: openProjectDialog
+        title: "Open Mission Project"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Skytec Mission (*.skytec)"]
+        onAccepted: {
+            currentProjectPath = selectedFile.toString()
+            let data = MissionController.loadProject(currentProjectPath)
+            loadProjectData(data)
+            statusLabel.text = "Project loaded."
+            window.isDirty = false
+        }
+    }
+
+    // Settings Menu Dialog
+    Dialog {
+        id: settingsDialog
+        title: "Application Settings"
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        Column {
+            spacing: 10
+            Label { text: "Map Cache Directory:" }
+            Row {
+                spacing: 5
+                TextField {
+                    id: cachePathInput
+                    width: 300
+                    readOnly: true
+                }
+                Button {
+                    text: "Browse..."
+                    onClicked: cacheFolderDialog.open()
+                }
+            }
+        }
+        onAccepted: {
+            MissionController.setCachePath(cachePathInput.text)
+            window.showProgress("Cache path updated. Engine will use new path on next map interaction.", 1.0)
+        }
+    }
+
+    Dialog {
+        id: closeWarningDialog
+        title: "Unsaved Changes"
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Save | Dialog.Discard | Dialog.Cancel
+
+        Label {
+            text: "You have unsaved changes. Do you want to save before exiting?"
+            padding: 10
+        }
+
+        onAccepted: { // The user clicked "Save"
+            window.requireSaveThen(function() {
+                window.forceClose = true
+                window.close()
+            })
+        }
+        onDiscarded: { // The user clicked "Discard"
+            window.forceClose = true
+            window.close()
+        }
+        // If they click Cancel, the dialog simply closes and nothing happens.
+    }
+
+    FolderDialog {
+        id: cacheFolderDialog
+        title: "Select Map Cache Directory"
+        onAccepted: cachePathInput.text = selectedFolder.toString()
+    }
+    // Platform.FolderDialog {
+    //     id: cacheFolderDialog
+    //     title: "Select Map Cache Directory"
+    //     // Note: Qt.labs uses 'folder' instead of 'selectedFolder'
+    //     onAccepted: cachePathInput.text = folder.toString()
+    // }
+
+    // [INJECT 1]: Verify the alias exists when the UI loads
+    Component.onCompleted: {
+        console.log("[DIAGNOSTIC 1] gdalRenderer resolves to:", gdalRenderer)
+    }
+
+    // State Variables
+    property real latitude: 28.6139
+    property real longitude: 77.2090
+    property real aoiWidthKm: 50
+    property real aoiHeightKm: 50
+
+    // Dynamic UI Bindings
+    latitudeField.text: String(latitude)
+    longitudeField.text: String(longitude)
+    // widthBox.value: aoiWidthKm
+    // heightBox.value: aoiHeightKm
+
+    // aoiBoxLabel.text: aoiWidthKm + " × " + aoiHeightKm + " km AOI"
+    // centerLabel.text: "Center: " + Number(latitude).toFixed(5) + ", " + Number(longitude).toFixed(5)
+    coordinateLabel.text: "Lat: " + Number(latitude).toFixed(5) + " | Lon: " + Number(longitude).toFixed(5)
+
+    // Menu Action Handlers
+    // actionNew.onTriggered: statusLabel.text = "New project"
+    // actionOpen.onTriggered: statusLabel.text = "Open project"
+    // actionSave.onTriggered: statusLabel.text = "Save project"
+    // actionExit.onTriggered: Qt.quit()
+
+    actionFitAoi.onTriggered: statusLabel.text = "Fit AOI"
+    actionResetView.onTriggered: statusLabel.text = "Reset view"
+
+    // actionGenerateAoi.onTriggered: generateButton.clicked()
+    actionAbout.onTriggered: aboutDialog.open()
+
+    // 1. Hook up the KML Export Menu Action
+    // actionExportKml.onTriggered: kmlFileDialog.open()
+    // Toolbar Button Handlers
+    // toolNew.onClicked: statusLabel.text = "New project"
+    // toolOpen.onClicked: statusLabel.text = "Open project"
+    // toolSave.onClicked: statusLabel.text = "Save project"
+
+    function showProgress(taskName, percent) {
+        if (percent >= 1.0) {
+            progressContainer.visible = false
+            statusLabel.text = "Ready"
+        } else {
+            progressContainer.visible = true
+            progressLabel.text = taskName
+            globalProgressBar.value = percent
+        }
+    }
+
+    function showError(message) {
+        errorToast.show(message)
+    }
+
+    // --- C++ SIGNAL CONNECTIONS ---
+    Connections {
+        target: gdalRenderer // Now uses the direct alias from MainForm
+
+        function onProgressUpdated(taskName, percent) {
+            console.log("[DIAGNOSTIC 5] QML caught progress signal:", percent)
+            showProgress(taskName, percent)
+        }
+
+        function onErrorReported(errorMessage) {
+            showError(errorMessage)
+        }
+
+        // Catch the view changed signal to update the estimator label
+        function onViewChanged() {
+            mapPanel.sizeEstimateLabel.text = "Est. Cache Size: " + gdalRenderer.estimateDownloadSize()
+        }
+
+        // Reset the download button when the C++ thread finishes
+        function onDownloadComplete() {
+            mapPanel.downloadMap.text = "Download map with checked features"
+            mapPanel.downloadMap.enabled = true
+            showProgress("Complete", 1.0)
+        }
+    }
+
+    // 2. Define the FileDialog
+    // FileDialog {
+    //     id: kmlFileDialog
+    //     title: "Export Trajectories to KML"
+    //     fileMode: FileDialog.SaveFile
+    //     nameFilters: ["KML Files (*.kml)"]
+    //     defaultSuffix: "kml"
+    //     onAccepted: {
+    //         // Pass the selected file URL to the C++ backend
+    //         statusLabel.text = "Exporting KML..."
+    //         MissionController.exportKml(selectedFile.toString())
+    //         statusLabel.text = "KML Export Complete"
+    //     }
+    // }
+    // Platform.FileDialog {
+    //     id: kmlFileDialog
+    //     title: "Export Trajectories to KML"
+    //     fileMode: Platform.FileDialog.SaveFile
+    //     nameFilters: ["KML Files (*.kml)"]
+    //     defaultSuffix: "kml"
+    //     onAccepted: {
+    //         // Note: Qt.labs uses 'file' instead of 'selectedFile'
+    //         statusLabel.text = "Exporting KML..."
+    //         MissionController.exportKml(file.toString())
+    //         statusLabel.text = "KML Export Complete"
+    //     }
+    // }
+    FileDialog {
+        id: kmlFileDialog
+        title: "Export Trajectories to KML"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["KML Files (*.kml)"]
+        defaultSuffix: "kml"
+        onAccepted: {
+            statusLabel.text = "Exporting KML..."
+            MissionController.exportKml(selectedFile.toString())
+            statusLabel.text = "KML Export Complete"
+        }
+    }
+
+    // 3. Catch the C++ signal to draw the top-level HARP envelope on the map
+    Connections {
+        target: MissionController
+        function onEnvelopeCalculated(perimeterPoints) {
+            mapCanvas.gdalRenderer.drawEnvelope(perimeterPoints)
+        }
+
+        // Triggers the global progress bar in the footer when fetching wind/running physics
+        function onProgressUpdated(taskName, percent) {
+            showProgress(taskName, percent)
+        }
+
+        // Triggers the red alert toast if the Open-Meteo API fails
+        function onErrorReported(errorMessage) {
+            showError(errorMessage)
+        }
+
+        // Draws the HARP polygon when the physics engine finishes
+        // function onEnvelopeCalculated(perimeterPoints) {
+        //     gdalRenderer.drawEnvelope(perimeterPoints)
+        // }
+    }
+    // Generate Button Logic
+    // generateButton.onClicked: {
+    //     if (latitudeField.acceptableInput && longitudeField.acceptableInput) {
+    //         latitude = Number(latitudeField.text)
+    //         longitude = Number(longitudeField.text)
+    //         aoiWidthKm = widthBox.value
+    //         aoiHeightKm = heightBox.value
+    //
+    //         statusLabel.text = "AOI parameters updated"
+    //
+    //         mapCanvas.gdalRenderer.updateMission(latitude, longitude, aoiWidthKm, aoiHeightKm)
+    //     } else {
+    //         statusLabel.text = "Enter valid coordinates"
+    //     }
+    // }
+    generateButton.onClicked: {
+        window.executeMission()
+    }
+}
+=== ./ui/MainForm.ui.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+ApplicationWindow {
+    id: window
+
+    visible: true
+    width: 1280
+    height: 800
+    minimumWidth: 900
+    minimumHeight: 600
+
+    title: "Mission Planner"
+    color: "#f2f4f7"
+
+
+    property alias lzNameField: missionPanel.lzNameField
+    // Top-level action aliases
+    property alias actionNew: actionNew
+    property alias actionOpen: actionOpen
+    property alias actionSave: actionSave
+    property alias actionSaveAs: actionSaveAs
+    property alias actionExit: actionExit
+    property alias actionExportKml: actionExportKml // ADD THIS
+
+    property alias actionSettings: actionSettings // ADD THIS
+
+    property alias progressContainer: progressContainer
+    property alias progressLabel: progressLabel
+    property alias globalProgressBar: globalProgressBar
+    property alias errorToast: errorToast
+
+    // property alias generateButton: missionPanel.generateButton
+    // ADD THESE THREE ALIASES:
+    property alias mapCanvas: mapCanvas
+    property alias gdalRenderer: mapCanvas.gdalRenderer
+    property alias mapPanel: mapPanel
+
+    property alias centerLatField: mapPanel.centerLatField
+    property alias centerLonField: mapPanel.centerLonField
+    property alias viewWidthField: mapPanel.viewWidthField
+
+    property alias actionFitAoi: actionFitAoi
+    property alias actionResetView: actionResetView
+    property alias actionConfigureMaster: actionConfigureMaster
+    property alias actionUpload: actionUpload
+    property alias actionAbout: actionAbout
+    property alias actionSetLightTheme: actionSetLightTheme
+    property alias actionSetDarkTheme: actionSetDarkTheme
+
+    property alias statusLabel: statusLabel
+    property alias coordinateLabel: coordinateLabel
+    property alias aboutDialog: aboutDialog
+
+    // Aliases to handle logic in standard .qml files
+    property alias filterInput: filterInput
+    property alias clearFilterButton: clearFilterButton
+
+    // Chained aliases from child components
+    property alias latitudeField: missionPanel.latitudeField
+    property alias longitudeField: missionPanel.longitudeField
+    property alias dateField: missionPanel.dateField // ADD THIS
+    property alias timeField: missionPanel.timeField // ADD THIS
+    property alias generateButton: missionPanel.generateButton
+
+    property alias elevationField: missionPanel.elevationField
+    property alias jumpAltField: missionPanel.jumpAltField
+    property alias canopyAltField: missionPanel.canopyAltField
+    property alias weightField: missionPanel.weightField
+    property alias airSpeedField: missionPanel.airSpeedField
+    property alias airHeadingField: missionPanel.airHeadingField
+    property alias canopyGroundSpeedField: missionPanel.canopyGroundSpeedField
+    property alias glideRatioField: missionPanel.glideRatioField
+
+    property alias windModel: windPanel.windModel // ADD THIS
+    // property alias widthBox: missionPanel.widthBox
+    // property alias heightBox: missionPanel.heightBox
+
+    // property alias aoiBoxLabel: mapCanvas.aoiBoxLabel
+    // property alias centerLabel: mapCanvas.centerLabel
+
+    menuBar: MenuBar {
+        Menu {
+            title: "File"
+            Action { id: actionNew; text: "New" }
+            Action { id: actionOpen; text: "Open" }
+            Action { id: actionSave; text: "Save" }
+            Action { id: actionSaveAs; text: "Save As" }
+            Action { id: actionExportKml; text: "Export KML..." } // ADD THIS
+            Action { id: actionSettings; text: "Settings" }
+            MenuSeparator {}
+            Action { id: actionExit; text: "Exit" }
+        }
+        Menu {
+            title: "Edit"
+            Action { text: "Undo" }
+            Action { text: "Redo" }
+            Action { text: "Preferences" }
+        }
+        Menu {
+            title: "View"
+            Menu {
+                title: "Theme"
+                Action { id: actionSetLightTheme; text: "Light" }
+                Action { id: actionSetDarkTheme; text: "Dark" }
+            }
+            MenuSeparator {}
+            Action { id: actionFitAoi; text: "Fit AOI" }
+            Action { id: actionResetView; text: "Reset View" }
+        }
+        Menu {
+            title: "Pathfinder"
+            Action { id: actionConfigureMaster; text: "Configure Master Pathfinder" }
+            Action { id: actionUpload; text: "Upload to Master" }
+        }
+        Menu {
+            title: "Help"
+            Action { id: actionAbout; text: "About SkytecMP" }
+        }
+    }
+
+    // 1. HEADER
+    header: ToolBar {
+        background: Rectangle {
+            color: "#f6f6f6"
+            border.color: "#dfdfdf"
+            border.width: 1
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 2
+            anchors.rightMargin: 2
+
+            Text {
+                text: "CLI:"
+                font.pixelSize: 11
+                color: "#333333"
+                Layout.leftMargin: 0
+            }
+
+            TextField {
+                id: filterInput
+                Layout.fillWidth: true
+                Layout.preferredHeight: 28
+                placeholderText: "Enter program parameters..."
+                font.family: "Consolas" // Fixed invalid font fallback array
+                font.pixelSize: 11
+                leftPadding: 6
+                verticalAlignment: TextInput.AlignVCenter
+
+                background: Rectangle {
+                    color: "#ffffff"
+                    border.color: "#9c9c9c"
+                    radius: 2
+                }
+            }
+
+            Button {
+                id: clearFilterButton
+                text: "⎘"
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+                // onClicked removed: Handle this in the controlling .qml file
+            }
+
+            Button {
+                text: "▼"
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+            }
+
+            Button {
+                text: "➔"
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+            }
+        }
+    }
+
+    // 2. MAIN CONTENT (Moved out of the header)
+    RowLayout {
+        anchors.fill: parent
+        spacing: 0
+
+        MissionPanel {
+            id: missionPanel
+        }
+
+        // MapCanvas {
+        //     id: mapCanvas
+        // }
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 0
+
+            MapCanvas {
+                id: mapCanvas
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
+
+            // Horizontal separator between Map Canvas and bottom panels
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 1
+                color: "#cccccc"
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.fillHeight: false
+                Layout.preferredHeight: 240 // Sets a fixed height for the bottom dock
+                Layout.maximumHeight: 240   // Prevents the panels from crushing the map
+                spacing: 20
+
+                MapPanel {
+                    id: mapPanel
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true // Fills the 240px height
+                    Layout.preferredWidth: 0
+                }
+
+                Rectangle {
+                    Layout.preferredWidth: 1
+                    Layout.fillHeight: true // Matches the 240px height
+                    color: "#cccccc"
+                }
+
+                WindPanel {
+                    id: windPanel
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true // Fills the 240px height
+                    Layout.preferredWidth: 0
+                }
+
+                // Item {
+                //     Layout.fillWidth: true // Pushes the panels cleanly to the left
+                // }
+            }
+        }
+    }
+
+    // 3. FOOTER
+    footer: ToolBar {
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 12
+            anchors.rightMargin: 12
+
+            Label {
+                id: statusLabel
+                text: "Ready"
+                Layout.preferredWidth: 200 // Fixed width keeps the middle container centered
+            }
+
+            Item { Layout.fillWidth: true } // Left spacer
+
+            // GLOBAL PROGRESS BAR CONTAINER
+            RowLayout {
+                id: progressContainer
+                visible: false // Hidden until an operation starts
+                spacing: 8
+
+                Label {
+                    id: progressLabel
+                    text: "Processing..."
+                    font.pixelSize: 12
+                }
+
+                ProgressBar {
+                    id: globalProgressBar
+                    value: 0.0
+                    Layout.preferredWidth: 200
+                }
+            }
+
+            Item { Layout.fillWidth: true } // Right spacer
+
+            Label {
+                id: coordinateLabel
+                Layout.alignment: Qt.AlignRight
+            }
+        }
+    }
+
+    // 4. UPPER-RIGHT ERROR NOTIFICATION (TOAST)
+    Popup {
+        id: errorToast
+        x: parent.width - width - 20 // Anchors to upper right
+        y: 20
+        width: 340
+        height: 60
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        background: Rectangle {
+            color: "#e53935" // Red alert color
+            radius: 6
+        }
+        contentItem: RowLayout {
+            Label { text: "⚠️"; font.pixelSize: 24; color: "white" }
+            Label {
+                id: errorToastText
+                color: "white"
+                font.bold: true
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+        }
+        Timer {
+            id: toastTimer
+            interval: 5000 // Auto-hides after 5 seconds
+            onTriggered: errorToast.close()
+        }
+        // Callable function to trigger the popup
+        function show(msg) {
+            errorToastText.text = msg
+            errorToast.open()
+            toastTimer.restart()
+        }
+    }
+
+    // 4. DIALOG (Moved out of the header)
+    Dialog {
+        id: aboutDialog
+        title: "About Mission_Planner"
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Ok
+        Label {
+            text: "GeoMap — Projected AOI and map viewer"
+        }
+    }
+}
+=== ./ui/mapcanvas/mapcanvas.cpp ===
+#include "mapcanvas.hpp"
+#include <QPainter>
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <cpl_vsi.h>
+#include <cpl_conv.h>
+#include <cmath>
+#include <ogr_spatialref.h>
+#include <gdalwarper.h>
+#include <gdal_alg.h>
+#include <QThread>
+#include <algorithm> // Required for std::clamp
+
+MapCanvasItem::MapCanvasItem(QQuickItem *parent) : QQuickPaintedItem(parent) {
+    GDALAllRegister();
+    CPLSetConfigOption("GDAL_CACHEMAX", "500");
+
+    // ADDED: Critical Network Rules. OSM will block you and hang the thread without these.
+    CPLSetConfigOption("GDAL_HTTP_USERAGENT", "MissionPlanner/1.0");
+    CPLSetConfigOption("GDAL_HTTP_TIMEOUT", "5");
+    CPLSetConfigOption("GDAL_HTTP_MAX_RETRY", "0");
+
+    // Read the XML from the Qt Resource System
+    QFile xmlFile(":/qt/qml/ui/mapcanvas/osm_config.xml");
+    if (!xmlFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Failed to load XML configuration from resources.";
+        return;
+    }
+
+    // Inject the local cache path into the XML template
+    QString rawXml = QTextStream(&xmlFile).readAll();
+    // QString cachePath = QDir::currentPath() + "/map_cache";
+    QSettings settings("Skytec", "MissionPlanner");
+    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/map_cache";
+    QString cachePath = settings.value("cachePath", defaultPath).toString();
+    QDir().mkpath(cachePath); // Guarantee folder exists before GDAL runs
+    QByteArray xmlConfig = rawXml.arg(cachePath).toUtf8();
+
+    VSIFCloseL(VSIFileFromMemBuffer("/vsimem/osm_config.xml", (GByte*)xmlConfig.data(), xmlConfig.size(), FALSE));
+
+    m_dataset = (GDALDataset*) GDALOpenEx("/vsimem/osm_config.xml", GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+
+    if (!m_dataset) {
+        qWarning() << "Failed to open GDAL Web Map dataset.";
+    }
+}
+
+// void MapCanvasItem::updateMission(double latitude, double longitude, double widthKm, double heightKm) {
+//     m_centerLat = latitude;
+//     m_centerLon = longitude;
+//     m_viewWidthMeters = widthKm * 1000.0;
+//     m_viewHeightMeters = heightKm * 1000.0;
+//
+//     if (!m_dataset) return;
+//
+//     int utmZone = static_cast<int>(std::floor((longitude + 180.0) / 6.0)) + 1;
+//     bool isNorth = (latitude >= 0.0);
+//
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//     utmSrs.SetWellKnownGeogCS("WGS84");
+//     utmSrs.SetUTM(utmZone, isNorth);
+//
+//     char *dstWkt = nullptr;
+//     utmSrs.exportToWkt(&dstWkt);
+//     m_utmWkt = QString(dstWkt);
+//     CPLFree(dstWkt);
+//
+//     OGRCoordinateTransformation *coordTrans = OGRCreateCoordinateTransformation(&latLonSrs, &utmSrs);
+//     double utmX = longitude;
+//     double utmY = latitude;
+//     if (coordTrans) {
+//         coordTrans->Transform(1, &utmX, &utmY);
+//         m_utmCenterX = utmX;
+//         m_utmCenterY = utmY;
+//         OCTDestroyCoordinateTransformation(coordTrans);
+//     }
+//
+//     refreshMapBuffer(); // Generate the image in memory
+//     emit viewChanged();
+// }
+void MapCanvasItem::updateMission(double latitude, double longitude, double widthKm, double heightKm) {
+    // 1. Clamp Latitude to Web Mercator limits (prevents Infinity math crashes at the poles)
+    latitude = std::clamp(latitude, -85.0511, 85.0511);
+
+    // 2. Wrap Longitude cleanly so crossing the International Date Line works perfectly
+    longitude = std::fmod(longitude, 360.0);
+    if (longitude >= 180.0) longitude -= 360.0;
+    else if (longitude < -180.0) longitude += 360.0;
+
+    // 3. Clamp camera view limits to prevent impossible map fetch requests
+    widthKm = std::clamp(widthKm, 0.05, 5000.0);
+    heightKm = std::clamp(heightKm, 0.05, 5000.0);
+
+    m_centerLat = latitude;
+    m_centerLon = longitude;
+    m_viewWidthMeters = widthKm * 1000.0;
+    m_viewHeightMeters = heightKm * 1000.0;
+
+    if (!m_dataset) return;
+
+    // [THE FIX]: Safely clamp the UTM zone strictly between 1 and 60
+    int utmZone = static_cast<int>(std::floor((longitude + 180.0) / 6.0)) + 1;
+    utmZone = std::clamp(utmZone, 1, 60);
+    bool isNorth = (latitude >= 0.0);
+
+    OGRSpatialReference latLonSrs, utmSrs;
+    latLonSrs.SetWellKnownGeogCS("WGS84");
+    latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utmSrs.SetWellKnownGeogCS("WGS84");
+    utmSrs.SetUTM(utmZone, isNorth);
+
+    char *dstWkt = nullptr;
+    utmSrs.exportToWkt(&dstWkt);
+    m_utmWkt = QString(dstWkt);
+    CPLFree(dstWkt);
+
+    OGRCoordinateTransformation *coordTrans = OGRCreateCoordinateTransformation(&latLonSrs, &utmSrs);
+    double utmX = longitude;
+    double utmY = latitude;
+    if (coordTrans) {
+        coordTrans->Transform(1, &utmX, &utmY);
+        m_utmCenterX = utmX;
+        m_utmCenterY = utmY;
+        OCTDestroyCoordinateTransformation(coordTrans);
+    }
+
+    refreshMapBuffer(); // Generate the image in memory
+    emit viewChanged();
+}
+
+void MapCanvasItem::forceRefresh() {
+    refreshMapBuffer();
+}
+
+// void MapCanvasItem::refreshMapBuffer() {
+//     if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return;
+//
+//     int screenWidth = boundingRect().width();
+//     int screenHeight = boundingRect().height();
+//     if (screenWidth <= 0 || screenHeight <= 0) return;
+//
+//     // --- [THE FIX]: Force a 1:1 Aspect Ratio (Square Pixels) ---
+//     // This dynamically recalculates the geographic height to match your physical window shape
+//     double aspectRatio = static_cast<double>(screenWidth) / screenHeight;
+//     m_viewHeightMeters = m_viewWidthMeters / aspectRatio;
+//
+//     GDALDriver *memDriver = GetGDALDriverManager()->GetDriverByName("MEM");
+//     if (!memDriver) return;
+//
+//     qDebug() << "\n--- [DIAGNOSTIC START] ---";
+//     qDebug() << "[1] Current UTM Center:" << m_utmCenterX << m_utmCenterY;
+//
+//     // --- 1. REVERSE MATH FIX ---
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+//     utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//     double currentLon = m_utmCenterX;
+//     double currentLat = m_utmCenterY;
+//     if (invTrans) {
+//         invTrans->Transform(1, &currentLon, &currentLat);
+//         OCTDestroyCoordinateTransformation(invTrans);
+//     }
+//
+//     qDebug() << "[2] Converted to Lat/Lon:" << currentLat << "(Lat) |" << currentLon << "(Lon)";
+//
+//     // Convert to Web Mercator
+//     double webMercCenterX = currentLon * 20037508.34 / 180.0;
+//     double latRad = currentLat * M_PI / 180.0;
+//     double webMercCenterY = log(tan(M_PI / 4.0 + latRad / 2.0)) * 20037508.34 / M_PI;
+//
+//     qDebug() << "[3] Target Web Mercator X/Y:" << webMercCenterX << webMercCenterY;
+//
+//     double pad = 1.2;
+//     double wmWidth = m_viewWidthMeters * pad;
+//     double wmHeight = m_viewHeightMeters * pad;
+//     double wmMinX = webMercCenterX - (wmWidth / 2.0);
+//     double wmMaxY = webMercCenterY + (wmHeight / 2.0);
+//
+//     int wmPixWidth = screenWidth * pad;
+//     int wmPixHeight = screenHeight * pad;
+//
+//     double wmsGeoTransform[6];
+//     m_dataset->GetGeoTransform(wmsGeoTransform);
+//     int xOff = static_cast<int>((wmMinX - wmsGeoTransform[0]) / wmsGeoTransform[1]);
+//     int yOff = static_cast<int>((wmMaxY - wmsGeoTransform[3]) / wmsGeoTransform[5]);
+//     int xSize = static_cast<int>(wmWidth / wmsGeoTransform[1]);
+//     int ySize = static_cast<int>(std::abs(wmHeight / wmsGeoTransform[5]));
+//
+//     std::vector<GByte> rawBuffer(wmPixWidth * wmPixHeight * 3, 255);
+//     int bands[3] = {1, 2, 3};
+//
+//     CPLErr fetchErr = m_dataset->RasterIO(GF_Read, xOff, yOff, xSize, ySize,
+//                         rawBuffer.data(), wmPixWidth, wmPixHeight,
+//                         GDT_Byte, 3, bands, 3, wmPixWidth * 3, 1);
+//
+//     if (fetchErr != CE_None) {
+//         qWarning() << "[4] FATAL: Network fetch failed:" << CPLGetLastErrorMsg();
+//         emit errorReported("Map Error: No internet connection and local cache is empty for this area.");
+//     } else {
+//         qDebug() << "[4] SUCCESS: Network chunk fetched.";
+//     }
+//
+//     GDALDataset *srcDS = memDriver->Create("", wmPixWidth, wmPixHeight, 3, GDT_Byte, nullptr);
+//     srcDS->RasterIO(GF_Write, 0, 0, wmPixWidth, wmPixHeight,
+//                     rawBuffer.data(), wmPixWidth, wmPixHeight,
+//                     GDT_Byte, 3, bands, 3, wmPixWidth * 3, 1);
+//
+//     double srcGeo[6] = { wmMinX, wmWidth/wmPixWidth, 0.0, wmMaxY, 0.0, -wmHeight/wmPixHeight };
+//     srcDS->SetGeoTransform(srcGeo);
+//
+//     // [THE FIX]: Generate a real WKT string for EPSG:3857 instead of a raw abbreviation
+//     OGRSpatialReference wmSrs;
+//     wmSrs.importFromEPSG(3857);
+//     char* wmWkt = nullptr;
+//     wmSrs.exportToWkt(&wmWkt);
+//     srcDS->SetProjection(wmWkt);
+//     CPLFree(wmWkt);
+//
+//     // --- 2. WARP PHASE ---
+//     // --- 2. WARP PHASE ---
+//     GDALDataset *dstDS = memDriver->Create("", screenWidth, screenHeight, 3, GDT_Byte, nullptr);
+//     QByteArray dstWktBytes = m_utmWkt.toUtf8();
+//     dstDS->SetProjection(dstWktBytes.constData());
+//
+//     double utmMinX = m_utmCenterX - (m_viewWidthMeters / 2.0);
+//     double utmMaxY = m_utmCenterY + (m_viewHeightMeters / 2.0);
+//     double dstGeo[6] = { utmMinX, m_viewWidthMeters/screenWidth, 0.0, utmMaxY, 0.0, -m_viewHeightMeters/screenHeight };
+//     dstDS->SetGeoTransform(dstGeo);
+//
+//     GDALWarpOptions *warpOpts = GDALCreateWarpOptions();
+//     warpOpts->hSrcDS = srcDS;
+//     warpOpts->hDstDS = dstDS;
+//     warpOpts->eResampleAlg = GRA_Bilinear;
+//     warpOpts->papszWarpOptions = CSLSetNameValue(warpOpts->papszWarpOptions, "INIT_DEST", "255,255,255");
+//
+//     // [THE FIX]: Create and assign the projection transformer function
+//     warpOpts->pfnTransformer = GDALGenImgProjTransform;
+//     warpOpts->pTransformerArg = GDALCreateGenImgProjTransformer2(srcDS, dstDS, nullptr);
+//
+//     GDALWarpOperation warpOp;
+//     if (warpOp.Initialize(warpOpts) == CE_None) {
+//         CPLErr warpErr = warpOp.ChunkAndWarpImage(0, 0, screenWidth, screenHeight);
+//         qDebug() << "[5] Warp Operation Output:" << (warpErr == CE_None ? "SUCCESS" : "FAILED");
+//     } else {
+//         qDebug() << "[5] Warp Operation Failed to Initialize!";
+//     }
+//
+//     // Clean up the transformer and options
+//     if (warpOpts->pTransformerArg) {
+//         GDALDestroyGenImgProjTransformer(warpOpts->pTransformerArg);
+//     }
+//     GDALDestroyWarpOptions(warpOpts);
+//
+//     // --- VISUAL DIAGNOSTIC DUMP ---
+//     GDALDriver *tiffDriver = GetGDALDriverManager()->GetDriverByName("GTiff");
+//     if (tiffDriver) {
+//         GDALDataset* dump1 = tiffDriver->CreateCopy("debug_webmercator_fetch.tif", srcDS, FALSE, nullptr, nullptr, nullptr);
+//         if (dump1) GDALClose(dump1);
+//
+//         GDALDataset* dump2 = tiffDriver->CreateCopy("debug_utm_warp.tif", dstDS, FALSE, nullptr, nullptr, nullptr);
+//         if (dump2) GDALClose(dump2);
+//         qDebug() << "[6] Wrote diagnostic .tif files to your cmake-build-debug folder.";
+//     }
+//
+//     // --- 3. RENDER PHASE ---
+//     std::vector<GByte> finalBuffer(screenWidth * screenHeight * 4, 255);
+//     dstDS->RasterIO(GF_Read, 0, 0, screenWidth, screenHeight,
+//                     finalBuffer.data(), screenWidth, screenHeight,
+//                     GDT_Byte, 3, bands, 4, screenWidth * 4, 1);
+//
+//     m_mapBuffer = QImage(finalBuffer.data(), screenWidth, screenHeight, QImage::Format_RGBA8888).copy();
+//     update();
+//
+//     GDALClose(srcDS);
+//     GDALClose(dstDS);
+//     qDebug() << "--- [DIAGNOSTIC END] ---\n";
+// }
+
+void MapCanvasItem::refreshMapBuffer() {
+    if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return;
+
+    int screenWidth = boundingRect().width();
+    int screenHeight = boundingRect().height();
+    if (screenWidth <= 0 || screenHeight <= 0) return;
+
+    // Force 1:1 Aspect Ratio
+    double aspectRatio = static_cast<double>(screenWidth) / screenHeight;
+    m_viewHeightMeters = m_viewWidthMeters / aspectRatio;
+
+    // 1. Thread Tracking (Cancels older threads if user pans quickly)
+    int fetchId = ++m_fetchCounter;
+    emit progressUpdated("Loading Map Data...", 0.0);
+
+    // 2. Snapshot current state by value
+    double viewW = m_viewWidthMeters;
+    double viewH = m_viewHeightMeters;
+    double utmCX = m_utmCenterX;
+    double utmCY = m_utmCenterY;
+    QString utmWkt = m_utmWkt;
+
+    // Load XML config dynamically for the background thread
+    QFile xmlFile(":/qt/qml/ui/mapcanvas/osm_config.xml");
+    if (!xmlFile.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+    // QString threadXmlConfig = QTextStream(&xmlFile).readAll().arg(QDir::currentPath() + "/map_cache");
+    QString rawXml = QTextStream(&xmlFile).readAll();
+
+    QSettings settings("Skytec", "MissionPlanner");
+    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/map_cache";
+    QString cachePath = settings.value("cachePath", defaultPath).toString();
+    QDir().mkpath(cachePath); // Guarantee folder exists before GDAL runs
+    QString threadXmlConfig = rawXml.arg(cachePath);
+
+
+    // 3. Launch Async Network Fetch
+    QtConcurrent::run([this, fetchId, viewW, viewH, utmCX, utmCY, utmWkt, threadXmlConfig, screenWidth, screenHeight]() {
+        GDALDriver *memDriver = GetGDALDriverManager()->GetDriverByName("MEM");
+        QByteArray xmlBytes = threadXmlConfig.toUtf8();
+        GDALDataset* threadDS = (GDALDataset*) GDALOpenEx(xmlBytes.constData(), GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+
+        if (!threadDS) return;
+
+        // Coordinate Math
+        OGRSpatialReference latLonSrs, utmSrs;
+        latLonSrs.SetWellKnownGeogCS("WGS84");
+        latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        utmSrs.importFromWkt(utmWkt.toStdString().c_str());
+        utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+        OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+        double currentLon = utmCX;
+        double currentLat = utmCY;
+        if (invTrans) {
+            invTrans->Transform(1, &currentLon, &currentLat);
+            OCTDestroyCoordinateTransformation(invTrans);
+        }
+
+        double webMercCenterX = currentLon * 20037508.34 / 180.0;
+        double latRad = currentLat * M_PI / 180.0;
+        double webMercCenterY = log(tan(M_PI / 4.0 + latRad / 2.0)) * 20037508.34 / M_PI;
+
+        // double pad = 1.2;
+        // double wmWidth = viewW * pad;
+        // double wmHeight = viewH * pad;
+        // double wmMinX = webMercCenterX - (wmWidth / 2.0);
+        // double wmMaxY = webMercCenterY + (wmHeight / 2.0);
+        // [THE FIX]: Account for Web Mercator latitude stretch
+        double scaleFactor = 1.0 / std::cos(latRad);
+        double pad = 1.2;
+
+        double wmWidth = viewW * scaleFactor * pad;
+        double wmHeight = viewH * scaleFactor * pad;
+
+        double wmMinX = webMercCenterX - (wmWidth / 2.0);
+        double wmMaxY = webMercCenterY + (wmHeight / 2.0);
+
+        int wmPixWidth = screenWidth * pad;
+        int wmPixHeight = screenHeight * pad;
+
+        double wmsGeoTransform[6];
+        threadDS->GetGeoTransform(wmsGeoTransform);
+        int xOff = static_cast<int>((wmMinX - wmsGeoTransform[0]) / wmsGeoTransform[1]);
+        int yOff = static_cast<int>((wmMaxY - wmsGeoTransform[3]) / wmsGeoTransform[5]);
+        int dsXSize = static_cast<int>(wmWidth / wmsGeoTransform[1]);
+        int dsYSize = static_cast<int>(std::abs(wmHeight / wmsGeoTransform[5]));
+
+        std::vector<GByte> rawBuffer(wmPixWidth * wmPixHeight * 3, 255);
+        int bands[3] = {1, 2, 3};
+
+        // 4. CHUNKED NETWORK FETCH (Provides real-time UI Progress)
+        int strips = 4;
+        bool fetchFailed = false;
+        for (int i = 0; i < strips; ++i) {
+            if (fetchId != m_fetchCounter) break; // Early abort if user panned again
+
+            int yOffStrip = yOff + (i * dsYSize / strips);
+            int ySizeStrip = dsYSize / strips;
+            int destYOff = i * wmPixHeight / strips;
+            int destYSize = wmPixHeight / strips;
+
+            CPLErr err = threadDS->RasterIO(GF_Read, xOff, yOffStrip, dsXSize, ySizeStrip,
+                                            rawBuffer.data() + (destYOff * wmPixWidth * 3),
+                                            wmPixWidth, destYSize,
+                                            GDT_Byte, 3, bands, 3, wmPixWidth * 3, 1);
+            if (err != CE_None) {
+                fetchFailed = true;
+                break;
+            }
+            emit progressUpdated("Fetching Live Map...", static_cast<double>(i + 1) / strips);
+        }
+
+        GDALClose(threadDS);
+
+        if (fetchId != m_fetchCounter) return; // Abort processing if stale
+
+        if (fetchFailed) {
+            emit errorReported("Map Error: No internet connection and cache is empty for this view.");
+            emit progressUpdated("Failed", 1.0);
+            return;
+        }
+
+        emit progressUpdated("Warping Projections...", 0.90);
+
+        // 5. WARP PHASE
+        GDALDataset *srcDS = memDriver->Create("", wmPixWidth, wmPixHeight, 3, GDT_Byte, nullptr);
+        srcDS->RasterIO(GF_Write, 0, 0, wmPixWidth, wmPixHeight, rawBuffer.data(), wmPixWidth, wmPixHeight, GDT_Byte, 3, bands, 3, wmPixWidth * 3, 1);
+        double srcGeo[6] = { wmMinX, wmWidth/wmPixWidth, 0.0, wmMaxY, 0.0, -wmHeight/wmPixHeight };
+        srcDS->SetGeoTransform(srcGeo);
+
+        OGRSpatialReference wmSrs;
+        wmSrs.importFromEPSG(3857);
+        char* wmWkt = nullptr;
+        wmSrs.exportToWkt(&wmWkt);
+        srcDS->SetProjection(wmWkt);
+        CPLFree(wmWkt);
+
+        GDALDataset *dstDS = memDriver->Create("", screenWidth, screenHeight, 3, GDT_Byte, nullptr);
+        dstDS->SetProjection(utmWkt.toStdString().c_str());
+        double utmMinX = utmCX - (viewW / 2.0);
+        double utmMaxY = utmCY + (viewH / 2.0);
+        double dstGeo[6] = { utmMinX, viewW/screenWidth, 0.0, utmMaxY, 0.0, -viewH/screenHeight };
+        dstDS->SetGeoTransform(dstGeo);
+
+        GDALWarpOptions *warpOpts = GDALCreateWarpOptions();
+        warpOpts->hSrcDS = srcDS;
+        warpOpts->hDstDS = dstDS;
+        warpOpts->eResampleAlg = GRA_Bilinear;
+        warpOpts->papszWarpOptions = CSLSetNameValue(warpOpts->papszWarpOptions, "INIT_DEST", "255,255,255");
+        warpOpts->pfnTransformer = GDALGenImgProjTransform;
+        warpOpts->pTransformerArg = GDALCreateGenImgProjTransformer2(srcDS, dstDS, nullptr);
+
+        GDALWarpOperation warpOp;
+        if (warpOp.Initialize(warpOpts) == CE_None) {
+            warpOp.ChunkAndWarpImage(0, 0, screenWidth, screenHeight);
+        }
+
+        if (warpOpts->pTransformerArg) GDALDestroyGenImgProjTransformer(warpOpts->pTransformerArg);
+        GDALDestroyWarpOptions(warpOpts);
+
+        // 6. RENDER PHASE (Sync back to Main UI Thread)
+        std::vector<GByte> finalBuffer(screenWidth * screenHeight * 4, 255);
+        dstDS->RasterIO(GF_Read, 0, 0, screenWidth, screenHeight, finalBuffer.data(), screenWidth, screenHeight, GDT_Byte, 3, bands, 4, screenWidth * 4, 1);
+
+        GDALClose(srcDS);
+        GDALClose(dstDS);
+
+        if (fetchId == m_fetchCounter) {
+            // QMetaObject marshals the final image back to the main UI thread safely
+            // QMetaObject::invokeMethod(this, [this, finalBuffer, screenWidth, screenHeight, fetchId]() {
+            QMetaObject::invokeMethod(this, [this, finalBuffer, screenWidth, screenHeight, fetchId, viewW, viewH, utmCX, utmCY]() {
+                if (fetchId == m_fetchCounter) {
+                    m_mapBuffer = QImage(finalBuffer.data(), screenWidth, screenHeight, QImage::Format_RGBA8888).copy();
+
+                    // LOCK the render coordinates to this specific image's boundaries
+                    m_renderUtmCenterX = utmCX;
+                    m_renderUtmCenterY = utmCY;
+                    m_renderViewWidth = viewW;
+                    m_renderViewHeight = viewH;
+
+                    update();
+                    emit progressUpdated("Ready", 1.0);
+                }
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
+// Missing Implementation: Zooming
+void MapCanvasItem::zoomMap(double factor) {
+    if (m_viewWidthMeters > 0 && m_viewHeightMeters > 0) {
+        // Change the geographic size of the bounding box
+        m_viewWidthMeters *= factor;
+        m_viewHeightMeters *= factor;
+
+        // Generate the new map image in memory, which will then call update()
+        refreshMapBuffer();
+        emit viewChanged();
+    }
+}
+
+void MapCanvasItem::panMapPixels(int dx, int dy) {
+    // Simply accumulate the pixel shift and tell Qt to redraw the screen
+    m_visualPanX += dx;
+    m_visualPanY += dy;
+    update(); // Triggers paint() instantly, no GDAL math!
+}
+
+// void MapCanvasItem::commitPan() {
+//     if (m_visualPanX == 0 && m_visualPanY == 0) return;
+//     if (boundingRect().width() == 0 || boundingRect().height() == 0) return;
+//
+//     // 1. Calculate how many meters the accumulated pixel shift represents
+//     double metersPerPixelX = m_viewWidthMeters / boundingRect().width();
+//     double metersPerPixelY = m_viewHeightMeters / boundingRect().height();
+//
+//     // 2. Apply the shift to the real geographic coordinates
+//     m_utmCenterX -= m_visualPanX * metersPerPixelX;
+//     m_utmCenterY += m_visualPanY * metersPerPixelY; // + because Screen Y is inverted
+//
+//     // 3. Reset the visual shift back to zero
+//     m_visualPanX = 0;
+//     m_visualPanY = 0;
+//
+//     // 4. Now perform the heavy GDAL network fetch and warp (Executes just once)
+//     refreshMapBuffer();
+//     emit viewChanged();
+// }
+// void MapCanvasItem::commitPan() {
+//     if (m_visualPanX == 0 && m_visualPanY == 0) return;
+//     if (boundingRect().width() == 0 || boundingRect().height() == 0) return;
+//
+//     double mppX = m_viewWidthMeters / boundingRect().width();
+//     double mppY = m_viewHeightMeters / boundingRect().height();
+//
+//     double newUtmX = m_utmCenterX - m_visualPanX * mppX;
+//     double newUtmY = m_utmCenterY + m_visualPanY * mppY;
+//
+//     // Reset visual pan buffer
+//     m_visualPanX = 0;
+//     m_visualPanY = 0;
+//
+//     // Convert the new UTM center back to Lat/Lon
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//     utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+//     utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//     if (invTrans) {
+//         double newLon = newUtmX;
+//         double newLat = newUtmY;
+//         invTrans->Transform(1, &newLon, &newLat);
+//         OCTDestroyCoordinateTransformation(invTrans);
+//
+//         // Feed it into updateMission. This instantly recalculates the UTM zone,
+//         // rebuilds the projection strings, and cleanly fetches the new map data.
+//         updateMission(newLat, newLon, m_viewWidthMeters / 1000.0, m_viewHeightMeters / 1000.0);
+//     }
+// }
+void MapCanvasItem::commitPan() {
+    if (m_visualPanX == 0 && m_visualPanY == 0) return;
+    if (boundingRect().width() == 0 || boundingRect().height() == 0) return;
+
+    double mppX = m_viewWidthMeters / boundingRect().width();
+    double mppY = m_viewHeightMeters / boundingRect().height();
+
+    double newUtmX = m_utmCenterX - m_visualPanX * mppX;
+    double newUtmY = m_utmCenterY + m_visualPanY * mppY;
+
+    m_visualPanX = 0;
+    m_visualPanY = 0;
+
+    OGRSpatialReference latLonSrs, utmSrs;
+    latLonSrs.SetWellKnownGeogCS("WGS84");
+    latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+    utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+    if (invTrans) {
+        double newLon = newUtmX;
+        double newLat = newUtmY;
+        invTrans->Transform(1, &newLon, &newLat);
+        OCTDestroyCoordinateTransformation(invTrans);
+
+        updateMission(newLat, newLon, m_viewWidthMeters / 1000.0, m_viewHeightMeters / 1000.0);
+    } else {
+        // [THE FIX]: If GDAL fails to transform, abort the pan and just refresh the map in place
+        refreshMapBuffer();
+        emit viewChanged();
+    }
+}
+
+// QString MapCanvasItem::estimateDownloadSize() {
+//     if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0) return "0 KB";
+//
+//     // Assuming 4 meters per pixel resolution target
+//     double targetXPixels = m_viewWidthMeters / 4.0;
+//     double targetYPixels = m_viewHeightMeters / 4.0;
+//     double totalPixels = targetXPixels * targetYPixels;
+//
+//     // A typical compressed OSM PNG tile averages ~0.4 bytes per pixel
+//     double estimatedBytes = totalPixels * 0.4;
+//     double estimatedMB = estimatedBytes / (1024.0 * 1024.0);
+//
+//     if (estimatedMB < 1.0) {
+//         return QString::number(estimatedMB * 1024.0, 'f', 1) + " KB";
+//     }
+//     return QString::number(estimatedMB, 'f', 1) + " MB";
+// }
+// QString MapCanvasItem::estimateDownloadSize() {
+//     if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0) return "0 KB";
+//
+//     int screenW = boundingRect().width();
+//     if (screenW <= 0) return "0 KB";
+//
+//     double currentRes = m_viewWidthMeters / screenW;
+//     const double MIN_RES = 1.0; // Max zoom depth set to 1 meter per pixel
+//
+//     double totalPixels = 0;
+//
+//     // Mathematically calculates exact pixel counts for every zoom level down to 1m/px
+//     for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+//         totalPixels += (m_viewWidthMeters / r) * (m_viewHeightMeters / r);
+//     }
+//
+//     double estimatedBytes = totalPixels * 0.4;
+//     double estimatedMB = estimatedBytes / (1024.0 * 1024.0);
+//
+//     if (estimatedMB < 1.0) {
+//         return QString::number(estimatedMB * 1024.0, 'f', 1) + " KB";
+//     }
+//     return QString::number(estimatedMB, 'f', 1) + " MB";
+// }
+QString MapCanvasItem::estimateDownloadSize() {
+    if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return "0 KB";
+
+    int screenW = boundingRect().width();
+    if (screenW <= 0) return "0 KB";
+
+    // 1. Calculate the exact padded Web Mercator geometry
+    double latRad = m_centerLat * M_PI / 180.0;
+    double scaleFactor = 1.0 / std::cos(latRad);
+    double pad = 3.0; // Matches the 3x padding applied in the downloader
+
+    double wmWidth = m_viewWidthMeters * scaleFactor * pad;
+    double wmHeight = m_viewHeightMeters * scaleFactor * pad;
+
+    // 2. Adjust base resolution to account for the padded width
+    double currentRes = wmWidth / (screenW * pad);
+    const double MIN_RES = 1.0;
+
+    double totalPixels = 0;
+    for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+        totalPixels += (wmWidth / r) * (wmHeight / r);
+    }
+
+    double estimatedBytes = totalPixels * 0.4;
+    double estimatedMB = estimatedBytes / (1024.0 * 1024.0);
+
+    if (estimatedMB < 1.0) {
+        return QString::number(estimatedMB * 1024.0, 'f', 1) + " KB";
+    }
+    return QString::number(estimatedMB, 'f', 1) + " MB";
+}
+
+// void MapCanvasItem::downloadMapOffline() {
+//     if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0) return;
+//
+//     // [INJECT 3]: Verify main thread entry
+//     qDebug() << "[DIAGNOSTIC 2] downloadMapOffline() triggered by QML.";
+//
+//     qDebug() << "Starting offline cache population in background thread...";
+//
+//     // 1. Load a fresh XML configuration dynamically for the background thread
+//     QFile xmlFile(":/qt/qml/ui/mapcanvas/osm_config.xml");
+//     if (!xmlFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//         qWarning() << "Failed to load XML configuration for background thread.";
+//         return;
+//     }
+//     QString rawXml = QTextStream(&xmlFile).readAll();
+//     QString cachePath = QDir::currentPath() + "/map_cache";
+//
+//     // Generate the final XML string
+//     QString threadXmlConfig = rawXml.arg(cachePath);
+//
+//     // 1. Snapshot the current view parameters by value so they don't change if the user pans during download
+//     double viewW = m_viewWidthMeters;
+//     double viewH = m_viewHeightMeters;
+//     double utmCX = m_utmCenterX;
+//     double utmCY = m_utmCenterY;
+//     QString utmWkt = m_utmWkt;
+//
+//     // 2. Launch the background thread
+//     QtConcurrent::run([this, viewW, viewH, utmCX, utmCY, utmWkt, threadXmlConfig]() {
+//         // [INJECT 4]: Verify thread start
+//         qDebug() << "[DIAGNOSTIC 3] QtConcurrent background thread started.";
+//         QByteArray xmlBytes = threadXmlConfig.toUtf8();
+//         // // Open a thread-local dataset so we don't collide with the UI thread's memory
+//         // GDALDataset* threadDS = (GDALDataset*) GDALOpenEx("/vsimem/osm_config.xml", GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+//         // Pass the raw XML string directly instead of using a /vsimem/ file
+//         GDALDataset* threadDS = (GDALDataset*) GDALOpenEx(xmlBytes.constData(), GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+//         if (!threadDS) {
+//             // [INJECT 5]: Check for silent early abort
+//             qDebug() << "[DIAGNOSTIC 4 - FATAL] threadDS failed to open. Thread aborting silently.";
+//             emit errorReported("Map Error: Failed to initialize background downloader.");
+//             return;
+//         }
+//
+//         qDebug() << "[DIAGNOSTIC 4] threadDS opened. Beginning chunk loop...";
+//
+//         OGRSpatialReference latLonSrs, utmSrs;
+//         latLonSrs.SetWellKnownGeogCS("WGS84");
+//         latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//         utmSrs.importFromWkt(utmWkt.toStdString().c_str());
+//         utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//         OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//         double currentLon = utmCX;
+//         double currentLat = utmCY;
+//         if (invTrans) {
+//             invTrans->Transform(1, &currentLon, &currentLat);
+//             OCTDestroyCoordinateTransformation(invTrans);
+//         }
+//
+//         double webMercCenterX = currentLon * 20037508.34 / 180.0;
+//         double latRad = currentLat * M_PI / 180.0;
+//         double webMercCenterY = log(tan(M_PI / 4.0 + latRad / 2.0)) * 20037508.34 / M_PI;
+//
+//         double wmMinX = webMercCenterX - (viewW / 2.0);
+//         double wmMaxY = webMercCenterY + (viewH / 2.0);
+//
+//         double wmsGeo[6];
+//         threadDS->GetGeoTransform(wmsGeo);
+//
+//         int xOff = static_cast<int>((wmMinX - wmsGeo[0]) / wmsGeo[1]);
+//         int yOff = static_cast<int>((wmMaxY - wmsGeo[3]) / wmsGeo[5]);
+//         int dsXSize = static_cast<int>(viewW / wmsGeo[1]);
+//         int dsYSize = static_cast<int>(std::abs(viewH / wmsGeo[5]));
+//
+//         int targetXPixels = static_cast<int>(viewW / 4.0);
+//         int targetYPixels = static_cast<int>(viewH / 4.0);
+//
+//         const int CHUNK = 1024;
+//         std::vector<GByte> dummyBuffer(CHUNK * CHUNK * 3);
+//         int bands[3] = {1, 2, 3};
+//
+//         // Calculate total chunks for the progress bar
+//         int numChunksX = std::ceil(targetXPixels / static_cast<double>(CHUNK));
+//         int numChunksY = std::ceil(targetYPixels / static_cast<double>(CHUNK));
+//         int totalChunks = numChunksX * numChunksY;
+//         if (totalChunks == 0) totalChunks = 1; // Prevent division by zero
+//         int currentChunk = 0;
+//
+//         for (int y = 0; y < targetYPixels; y += CHUNK) {
+//             for (int x = 0; x < targetXPixels; x += CHUNK) {
+//                 int readXSize = std::min(CHUNK, targetXPixels - x);
+//                 int readYSize = std::min(CHUNK, targetYPixels - y);
+//
+//                 int srcXOff = xOff + (x * dsXSize / targetXPixels);
+//                 int srcYOff = yOff + (y * dsYSize / targetYPixels);
+//                 int srcXSize = readXSize * dsXSize / targetXPixels;
+//                 int srcYSize = readYSize * dsYSize / targetYPixels;
+//
+//                 threadDS->RasterIO(GF_Read, srcXOff, srcYOff, srcXSize, srcYSize,
+//                                     dummyBuffer.data(), readXSize, readYSize,
+//                                     GDT_Byte, 3, bands, 3, readXSize * 3, 1);
+//
+//                 // ADD THIS: Wait 100 milliseconds between chunks to bypass OSM anti-bot throttling
+//                 QThread::msleep(100);
+//                 // Update the progress bar
+//                 currentChunk++;
+//                 double pct = static_cast<double>(currentChunk) / totalChunks;
+//                 emit progressUpdated("Downloading Map Cache...", pct);
+//             }
+//         }
+//
+//         GDALClose(threadDS);
+//         qDebug() << "Background download complete.";
+//         // Hide the progress bar
+//         emit progressUpdated("Downloading Map Cache...", 1.0);
+//         emit downloadComplete(); // Notify the UI thread
+//     });
+// }
+// void MapCanvasItem::downloadMapOffline() {
+//     if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0) return;
+//
+//     int screenW = boundingRect().width();
+//     int screenH = boundingRect().height();
+//     if (screenW <= 0 || screenH <= 0) return;
+//
+//     QFile xmlFile(":/qt/qml/ui/mapcanvas/osm_config.xml");
+//     if (!xmlFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//         emit errorReported("Map Error: Failed to load XML configuration.");
+//         return;
+//     }
+//     QString threadXmlConfig = QTextStream(&xmlFile).readAll().arg(QDir::currentPath() + "/map_cache");
+//
+//     double viewW = m_viewWidthMeters;
+//     double viewH = m_viewHeightMeters;
+//     double utmCX = m_utmCenterX;
+//     double utmCY = m_utmCenterY;
+//     QString utmWkt = m_utmWkt;
+//
+//     QtConcurrent::run([this, viewW, viewH, utmCX, utmCY, utmWkt, threadXmlConfig, screenW, screenH]() {
+//         QByteArray xmlBytes = threadXmlConfig.toUtf8();
+//         GDALDataset* threadDS = (GDALDataset*) GDALOpenEx(xmlBytes.constData(), GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+//         if (!threadDS) {
+//             emit errorReported("Map Error: Failed to initialize background downloader.");
+//             return;
+//         }
+//
+//         OGRSpatialReference latLonSrs, utmSrs;
+//         latLonSrs.SetWellKnownGeogCS("WGS84");
+//         latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//         utmSrs.importFromWkt(utmWkt.toStdString().c_str());
+//         utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//         OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//         double currentLon = utmCX;
+//         double currentLat = utmCY;
+//         if (invTrans) {
+//             invTrans->Transform(1, &currentLon, &currentLat);
+//             OCTDestroyCoordinateTransformation(invTrans);
+//         }
+//
+//         double webMercCenterX = currentLon * 20037508.34 / 180.0;
+//         double latRad = currentLat * M_PI / 180.0;
+//         double webMercCenterY = log(tan(M_PI / 4.0 + latRad / 2.0)) * 20037508.34 / M_PI;
+//         // double wmMinX = webMercCenterX - (viewW / 2.0);
+//         // double wmMaxY = webMercCenterY + (viewH / 2.0);
+//         // [THE FIX]: Ensure the offline pyramid fetch accounts for latitude stretch
+//         double scaleFactor = 1.0 / std::cos(latRad);
+//
+//         double wmMinX = webMercCenterX - (viewW * scaleFactor / 2.0);
+//         double wmMaxY = webMercCenterY + (viewH * scaleFactor / 2.0);
+//
+//         double wmsGeo[6];
+//         threadDS->GetGeoTransform(wmsGeo);
+//
+//         int xOff = static_cast<int>((wmMinX - wmsGeo[0]) / wmsGeo[1]);
+//         int yOff = static_cast<int>((wmMaxY - wmsGeo[3]) / wmsGeo[5]);
+//         int dsXSize = static_cast<int>(viewW / wmsGeo[1]);
+//         int dsYSize = static_cast<int>(std::abs(viewH / wmsGeo[5]));
+//
+//         const int CHUNK = 512;
+//         std::vector<GByte> dummyBuffer(CHUNK * CHUNK * 3);
+//         int bands[3] = {1, 2, 3};
+//
+//         double currentRes = viewW / screenW;
+//         const double MIN_RES = 1.0;
+//
+//         // 1. Pre-calculate total chunks for accurate progress tracking
+//         int totalChunks = 0;
+//         for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+//             int targetXPixels = viewW / r;
+//             int targetYPixels = viewH / r;
+//             totalChunks += std::ceil(static_cast<double>(targetXPixels) / CHUNK) *
+//                            std::ceil(static_cast<double>(targetYPixels) / CHUNK);
+//         }
+//         if (totalChunks == 0) totalChunks = 1;
+//
+//         int currentChunk = 0;
+//         int layer = 1;
+//
+//         // 2. Execute the Pyramid Fetch
+//         for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+//             int targetXPixels = viewW / r;
+//             int targetYPixels = viewH / r;
+//
+//             for (int y = 0; y < targetYPixels; y += CHUNK) {
+//                 for (int x = 0; x < targetXPixels; x += CHUNK) {
+//                     int readXSize = std::min(CHUNK, targetXPixels - x);
+//                     int readYSize = std::min(CHUNK, targetYPixels - y);
+//
+//                     int srcXOff = xOff + (x * dsXSize / targetXPixels);
+//                     int srcYOff = yOff + (y * dsYSize / targetYPixels);
+//                     int srcXSize = readXSize * dsXSize / targetXPixels;
+//                     int srcYSize = readYSize * dsYSize / targetYPixels;
+//
+//                     threadDS->RasterIO(GF_Read, srcXOff, srcYOff, srcXSize, srcYSize,
+//                                         dummyBuffer.data(), readXSize, readYSize,
+//                                         GDT_Byte, 3, bands, 3, readXSize * 3, 1);
+//
+//                     QThread::msleep(50); // Paced to avoid IP ban
+//
+//                     currentChunk++;
+//                     double pct = static_cast<double>(currentChunk) / totalChunks;
+//                     emit progressUpdated(QString("Caching Map Depth %1...").arg(layer), pct);
+//                 }
+//             }
+//             layer++;
+//         }
+//
+//         GDALClose(threadDS);
+//         emit progressUpdated("Offline Cache Complete", 1.0);
+//         emit downloadComplete();
+//     });
+// }
+void MapCanvasItem::downloadMapOffline() {
+    if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0) return;
+
+    int screenW = boundingRect().width();
+    int screenH = boundingRect().height();
+    if (screenW <= 0 || screenH <= 0) return;
+
+    QFile xmlFile(":/qt/qml/ui/mapcanvas/osm_config.xml");
+    if (!xmlFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        emit errorReported("Map Error: Failed to load XML configuration.");
+        return;
+    }
+    // QString threadXmlConfig = QTextStream(&xmlFile).readAll().arg(QDir::currentPath() + "/map_cache");
+    QString rawXml = QTextStream(&xmlFile).readAll();
+
+    // Dynamically retrieve the cache path from settings
+    QSettings settings("Skytec", "MissionPlanner");
+    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/map_cache";
+    QString cachePath = settings.value("cachePath", defaultPath).toString();
+    QDir().mkpath(cachePath); // Guarantee folder exists before GDAL runs
+
+    // Generate the final XML string
+    QString threadXmlConfig = rawXml.arg(cachePath);
+
+    double viewW = m_viewWidthMeters;
+    double viewH = m_viewHeightMeters;
+    double utmCX = m_utmCenterX;
+    double utmCY = m_utmCenterY;
+    QString utmWkt = m_utmWkt;
+
+    QtConcurrent::run([this, viewW, viewH, utmCX, utmCY, utmWkt, threadXmlConfig, screenW, screenH]() {
+        QByteArray xmlBytes = threadXmlConfig.toUtf8();
+        GDALDataset* threadDS = (GDALDataset*) GDALOpenEx(xmlBytes.constData(), GDAL_OF_RASTER, nullptr, nullptr, nullptr);
+        if (!threadDS) {
+            emit errorReported("Map Error: Failed to initialize background downloader.");
+            return;
+        }
+
+        OGRSpatialReference latLonSrs, utmSrs;
+        latLonSrs.SetWellKnownGeogCS("WGS84");
+        latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        utmSrs.importFromWkt(utmWkt.toStdString().c_str());
+        utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+        OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+        double currentLon = utmCX;
+        double currentLat = utmCY;
+        if (invTrans) {
+            invTrans->Transform(1, &currentLon, &currentLat);
+            OCTDestroyCoordinateTransformation(invTrans);
+        }
+
+        double webMercCenterX = currentLon * 20037508.34 / 180.0;
+        double latRad = currentLat * M_PI / 180.0;
+        double webMercCenterY = log(tan(M_PI / 4.0 + latRad / 2.0)) * 20037508.34 / M_PI;
+
+        // 1. CALCULATE THE OFFLINE PANNING BUFFER
+        double scaleFactor = 1.0 / std::cos(latRad);
+        double pad = 3.0; // Downloads 1 full screen in every direction surrounding your current view
+
+        double wmWidth = viewW * scaleFactor * pad;
+        double wmHeight = viewH * scaleFactor * pad;
+
+        double wmMinX = webMercCenterX - (wmWidth / 2.0);
+        double wmMaxY = webMercCenterY + (wmHeight / 2.0);
+
+        double wmsGeo[6];
+        threadDS->GetGeoTransform(wmsGeo);
+
+        int xOff = static_cast<int>((wmMinX - wmsGeo[0]) / wmsGeo[1]);
+        int yOff = static_cast<int>((wmMaxY - wmsGeo[3]) / wmsGeo[5]);
+        int dsXSize = static_cast<int>(wmWidth / wmsGeo[1]);
+        int dsYSize = static_cast<int>(std::abs(wmHeight / wmsGeo[5]));
+
+        const int CHUNK = 512;
+        std::vector<GByte> dummyBuffer(CHUNK * CHUNK * 3);
+        int bands[3] = {1, 2, 3};
+
+        // 2. CALIBRATE RESOLUTION TO THE PADDED GEOMETRY
+        double currentRes = wmWidth / (screenW * pad);
+        const double MIN_RES = 1.0;
+
+        int totalChunks = 0;
+        for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+            int targetXPixels = wmWidth / r;
+            int targetYPixels = wmHeight / r;
+            totalChunks += std::ceil(static_cast<double>(targetXPixels) / CHUNK) *
+                           std::ceil(static_cast<double>(targetYPixels) / CHUNK);
+        }
+        if (totalChunks == 0) totalChunks = 1;
+
+        int currentChunk = 0;
+        int layer = 1;
+
+        // 3. EXECUTE PYRAMID FETCH
+        for (double r = currentRes; r >= MIN_RES; r /= 2.0) {
+            int targetXPixels = wmWidth / r;
+            int targetYPixels = wmHeight / r;
+
+            for (int y = 0; y < targetYPixels; y += CHUNK) {
+                for (int x = 0; x < targetXPixels; x += CHUNK) {
+                    int readXSize = std::min(CHUNK, targetXPixels - x);
+                    int readYSize = std::min(CHUNK, targetYPixels - y);
+
+                    int srcXOff = xOff + (x * dsXSize / targetXPixels);
+                    int srcYOff = yOff + (y * dsYSize / targetYPixels);
+                    int srcXSize = readXSize * dsXSize / targetXPixels;
+                    int srcYSize = readYSize * dsYSize / targetYPixels;
+
+                    threadDS->RasterIO(GF_Read, srcXOff, srcYOff, srcXSize, srcYSize,
+                                        dummyBuffer.data(), readXSize, readYSize,
+                                        GDT_Byte, 3, bands, 3, readXSize * 3, 1);
+
+                    QThread::msleep(50); // Paced to avoid IP ban
+
+                    currentChunk++;
+                    double pct = static_cast<double>(currentChunk) / totalChunks;
+                    emit progressUpdated(QString("Caching Map Depth %1...").arg(layer), pct);
+                }
+            }
+            layer++;
+        }
+
+        GDALClose(threadDS);
+        emit progressUpdated("Offline Cache Complete", 1.0);
+        emit downloadComplete();
+    });
+}
+
+// void MapCanvasItem::paint(QPainter *painter) {
+//     if (!m_dataset || m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return;
+//
+//     int screenWidth = boundingRect().width();
+//     int screenHeight = boundingRect().height();
+//     if (screenWidth <= 0 || screenHeight <= 0) return;
+//
+//     // 1. Create an in-memory dataset matching the exact QML canvas dimensions
+//     GDALDriver *memDriver = GetGDALDriverManager()->GetDriverByName("MEM");
+//     if (!memDriver) return;
+//
+//     GDALDataset *memDS = memDriver->Create("", screenWidth, screenHeight, 3, GDT_Byte, nullptr);
+//     if (!memDS) return;
+//
+//     // 2. Assign the UTM projection to the memory dataset
+//     memDS->SetProjection(m_utmWkt.toStdString().c_str());
+//
+//     // 3. Map the dataset's pixels to the exact UTM meters of our current view
+//     double mppX = m_viewWidthMeters / screenWidth;
+//     double mppY = m_viewHeightMeters / screenHeight;
+//     double viewMinX = m_utmCenterX - (m_viewWidthMeters / 2.0);
+//     double viewMaxY = m_utmCenterY + (m_viewHeightMeters / 2.0);
+//
+//     // Set the GeoTransform (TopLeft X, X Pixel Size, X Rotation, TopLeft Y, Y Rotation, Y Pixel Size)
+//     double geoTransform[6] = { viewMinX, mppX, 0.0, viewMaxY, 0.0, -mppY };
+//     memDS->SetGeoTransform(geoTransform);
+//
+//     // 4. Perform a highly targeted reprojection directly into the memory dataset
+//     const char* srcWkt = m_dataset->GetProjectionRef();
+//     GDALReprojectImage(m_dataset, srcWkt,
+//                        memDS, m_utmWkt.toStdString().c_str(),
+//                        GRA_Bilinear, 0.0, 0.0, nullptr, nullptr, nullptr);
+//
+//     // 5. Read the crisp, reprojected pixels into the QImage buffer
+//     std::vector<GByte> buffer(screenWidth * screenHeight * 4, 255);
+//     int bands[3] = {1, 2, 3};
+//
+//     memDS->RasterIO(GF_Read, 0, 0, screenWidth, screenHeight,
+//                     buffer.data(), screenWidth, screenHeight,
+//                     GDT_Byte, 3, bands,
+//                     4, screenWidth * 4, 1);
+//
+//     m_mapBuffer = QImage(buffer.data(), screenWidth, screenHeight, QImage::Format_RGBA8888).copy();
+//     painter->drawImage(0, 0, m_mapBuffer);
+//
+//     // Clean up the memory dataset for this frame
+//     GDALClose(memDS);
+// }
+
+void MapCanvasItem::drawEnvelope(const QVariantList& perimeterPoints) {
+    m_rawEnvelope = perimeterPoints;
+    update(); // Trigger paint() to overlay the polygon
+}
+
+void MapCanvasItem::paint(QPainter *painter) {
+    if (!m_mapBuffer.isNull()) {
+        // Fill the background with a neutral color so edges aren't jarring during a pan
+        painter->fillRect(boundingRect(), QColor("#e8edf0"));
+
+        // Draw the image offset by the current mouse drag distance
+        painter->drawImage(m_visualPanX, m_visualPanY, m_mapBuffer);
+    }
+
+    // 2. Draw the HARP Envelope if data exists
+    if (!m_rawEnvelope.isEmpty() && m_viewWidthMeters > 0) {
+        int screenWidth = boundingRect().width();
+        int screenHeight = boundingRect().height();
+
+        // double mppX = m_viewWidthMeters / screenWidth;
+        // double mppY = m_viewHeightMeters / screenHeight;
+        // double viewMinX = m_utmCenterX - (m_viewWidthMeters / 2.0);
+        // double viewMaxY = m_utmCenterY + (m_viewHeightMeters / 2.0);
+        // Use the locked RENDER coordinates, not the live camera coordinates
+        double mppX = m_renderViewWidth / screenWidth;
+        double mppY = m_renderViewHeight / screenHeight;
+        double viewMinX = m_renderUtmCenterX - (m_renderViewWidth / 2.0);
+        double viewMaxY = m_renderUtmCenterY + (m_renderViewHeight / 2.0);
+
+        // Setup projection transformers (WGS84 -> Current UTM Zone)
+        OGRSpatialReference latLonSrs, utmSrs;
+        latLonSrs.SetWellKnownGeogCS("WGS84");
+        latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+        utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+        OGRCoordinateTransformation *coordTrans = OGRCreateCoordinateTransformation(&latLonSrs, &utmSrs);
+
+        QPolygonF envelopePolygon;
+
+        for (const QVariant& vPt : m_rawEnvelope) {
+            QVariantMap pt = vPt.toMap();
+            double lon = pt["lon"].toDouble();
+            double lat = pt["lat"].toDouble();
+
+            if (coordTrans) {
+                coordTrans->Transform(1, &lon, &lat); // Overwrites with UTM X/Y
+            }
+
+            // Convert UTM spatial coordinates to Screen Pixels (incorporating active visual pan)
+            double screenX = ((lon - viewMinX) / mppX) + m_visualPanX;
+            double screenY = ((viewMaxY - lat) / mppY) + m_visualPanY;
+
+            envelopePolygon.append(QPointF(screenX, screenY));
+        }
+
+        if (coordTrans) OCTDestroyCoordinateTransformation(coordTrans);
+
+        // Render the polygon with transparency
+        painter->setRenderHint(QPainter::Antialiasing);
+        painter->setPen(QPen(QColor(255, 0, 0, 200), 2)); // Red border
+        painter->setBrush(QColor(255, 0, 0, 50));         // Semi-transparent red fill
+        painter->drawPolygon(envelopePolygon);
+    }
+
+    // 3. Draw Markers (LZ and DZ)
+    if ((m_showLz || m_showDz) && m_renderViewWidth > 0) {
+        int screenWidth = boundingRect().width();
+        int screenHeight = boundingRect().height();
+        double mppX = m_renderViewWidth / screenWidth;
+        double mppY = m_renderViewHeight / screenHeight;
+        double viewMinX = m_renderUtmCenterX - (m_renderViewWidth / 2.0);
+        double viewMaxY = m_renderUtmCenterY + (m_renderViewHeight / 2.0);
+
+        OGRSpatialReference latLonSrs, utmSrs;
+        latLonSrs.SetWellKnownGeogCS("WGS84");
+        latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+        utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        OGRCoordinateTransformation *coordTrans = OGRCreateCoordinateTransformation(&latLonSrs, &utmSrs);
+
+        painter->setRenderHint(QPainter::Antialiasing);
+
+        if (m_showDz && coordTrans) {
+            double lon = m_dzLon; double lat = m_dzLat;
+            coordTrans->Transform(1, &lon, &lat); // Transforms Lat/Lon to UTM
+            double screenX = ((lon - viewMinX) / mppX) + m_visualPanX;
+            double screenY = ((viewMaxY - lat) / mppY) + m_visualPanY;
+
+            // Draw infinite flight line
+            double rad = m_acHdg * M_PI / 180.0;
+            double dx = std::sin(rad);
+            double dy = -std::cos(rad);
+            QPointF p1(screenX - dx * 3000, screenY - dy * 3000);
+            QPointF p2(screenX + dx * 3000, screenY + dy * 3000);
+
+            painter->setPen(QPen(QColor(0, 0, 0, 150), 2, Qt::DashLine));
+            painter->drawLine(p1, p2);
+
+            // Draw T-Point rotated to heading
+            painter->save();
+            painter->translate(screenX, screenY);
+            painter->rotate(m_acHdg); // Rotates the painter coordinate system to Aircraft Heading
+            painter->setPen(QPen(QColor(255, 140, 0), 3)); // Orange T
+            painter->drawLine(-10, -10, 10, -10); // Crossbar (leads flight path)
+            painter->drawLine(0, -10, 0, 10);     // Stem
+
+            painter->setPen(QColor(0, 0, 0));
+            painter->drawText(15, -15, "DZ");
+            painter->restore();
+        }
+
+        if (m_showLz && coordTrans) {
+            double lon = m_lzLon; double lat = m_lzLat;
+            coordTrans->Transform(1, &lon, &lat);
+            double screenX = ((lon - viewMinX) / mppX) + m_visualPanX;
+            double screenY = ((viewMaxY - lat) / mppY) + m_visualPanY;
+
+            painter->setPen(QPen(QColor(0, 100, 255), 2));
+            painter->setBrush(QColor(0, 100, 255, 100));
+            painter->drawEllipse(QPointF(screenX, screenY), 7, 7);
+
+            painter->setPen(QColor(0, 0, 0));
+            painter->drawText(screenX + 10, screenY + 5, "LZ");
+        }
+
+        if (coordTrans) OCTDestroyCoordinateTransformation(coordTrans);
+    }
+
+    // // ... [existing envelope drawing code inside paint()] ...
+    //
+    // // 3. Draw the Central Crosshairs
+    // int screenW = boundingRect().width();
+    // int screenH = boundingRect().height();
+    //
+    // painter->setPen(QPen(QColor(0, 0, 0, 100), 1, Qt::DashLine));
+    // painter->drawLine(screenW / 2, 0, screenW / 2, screenH); // Y Axis
+    // painter->drawLine(0, screenH / 2, screenW, screenH / 2); // X Axis
+    //
+    // painter->setPen(QPen(QColor(255, 0, 0, 200), 1.5));
+    // painter->drawEllipse(QPointF(screenW / 2, screenH / 2), 6, 6); // Center Reticle
+}
+
+// QPointF MapCanvasItem::screenToGeo(int mouseX, int mouseY) {
+//     if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return QPointF(0, 0);
+//
+//     int sw = boundingRect().width();
+//     int sh = boundingRect().height();
+//     if (sw <= 0 || sh <= 0) return QPointF(0, 0);
+//
+//     double mppX = m_viewWidthMeters / sw;
+//     double mppY = m_viewHeightMeters / sh;
+//
+//     double viewMinX = m_utmCenterX - (m_viewWidthMeters / 2.0);
+//     double viewMaxY = m_utmCenterY + (m_viewHeightMeters / 2.0);
+//
+//     // Apply active drag visual offset
+//     double utmX = viewMinX + ((mouseX - m_visualPanX) * mppX);
+//     double utmY = viewMaxY - ((mouseY - m_visualPanY) * mppY);
+//
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//     utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+//     utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//     double lon = utmX;
+//     double lat = utmY;
+//     if (invTrans) {
+//         invTrans->Transform(1, &lon, &lat);
+//         OCTDestroyCoordinateTransformation(invTrans);
+//     }
+//     return QPointF(lat, lon); // QPointF.x = Lat, QPointF.y = Lon
+// }
+//
+// QPointF MapCanvasItem::getCenterGeo() {
+//     // Return the exact center by converting the raw UTM center to Lat/Lon
+//     if (m_utmWkt.isEmpty()) return QPointF(0, 0);
+//
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//     utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+//     utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//     double lon = m_utmCenterX;
+//     double lat = m_utmCenterY;
+//     if (invTrans) {
+//         invTrans->Transform(1, &lon, &lat);
+//         OCTDestroyCoordinateTransformation(invTrans);
+//     }
+//     return QPointF(lat, lon);
+// }
+//
+// double MapCanvasItem::getViewWidthKm() {
+//     return m_viewWidthMeters / 1000.0;
+// }
+//
+// void MapCanvasItem::setViewWidthKm(double km) {
+//     if (km <= 0) return;
+//     m_viewWidthMeters = km * 1000.0;
+//     // Aspect ratio auto-corrects height in refreshMapBuffer
+//     refreshMapBuffer();
+//     emit viewChanged();
+// }
+// QPointF MapCanvasItem::screenToLatLon(int x, int y) {
+//     if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return QPointF(0, 0);
+//     int sw = boundingRect().width();
+//     int sh = boundingRect().height();
+//     if (sw <= 0 || sh <= 0) return QPointF(0, 0);
+//
+//     double mppX = m_viewWidthMeters / sw;
+//     double mppY = m_viewHeightMeters / sh;
+//
+//     // Account for active dragging offset
+//     double mapX = x - m_visualPanX;
+//     double mapY = y - m_visualPanY;
+//
+//     // Convert screen pixel to UTM meters
+//     double utmX = (m_utmCenterX - m_viewWidthMeters / 2.0) + (mapX * mppX);
+//     double utmY = (m_utmCenterY + m_viewHeightMeters / 2.0) - (mapY * mppY);
+//
+//     // Transform UTM back to WGS84
+//     OGRSpatialReference latLonSrs, utmSrs;
+//     latLonSrs.SetWellKnownGeogCS("WGS84");
+//     latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//     utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+//     utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+//
+//     OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+//     if (invTrans) {
+//         invTrans->Transform(1, &utmX, &utmY);
+//         OCTDestroyCoordinateTransformation(invTrans);
+//     }
+//
+//     // Return Lon (X) and Lat (Y)
+//     return QPointF(utmX, utmY);
+// }
+QPointF MapCanvasItem::screenToLatLon(int x, int y) {
+    if (m_viewWidthMeters <= 0 || m_viewHeightMeters <= 0 || m_utmWkt.isEmpty()) return QPointF(0, 0);
+    int sw = boundingRect().width();
+    int sh = boundingRect().height();
+    if (sw <= 0 || sh <= 0) return QPointF(0, 0);
+
+    double mppX = m_viewWidthMeters / sw;
+    double mppY = m_viewHeightMeters / sh;
+
+    double mapX = x - m_visualPanX;
+    double mapY = y - m_visualPanY;
+
+    double utmX = (m_utmCenterX - m_viewWidthMeters / 2.0) + (mapX * mppX);
+    double utmY = (m_utmCenterY + m_viewHeightMeters / 2.0) - (mapY * mppY);
+
+    OGRSpatialReference latLonSrs, utmSrs;
+    latLonSrs.SetWellKnownGeogCS("WGS84");
+    latLonSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utmSrs.importFromWkt(m_utmWkt.toStdString().c_str());
+    utmSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRCoordinateTransformation *invTrans = OGRCreateCoordinateTransformation(&utmSrs, &latLonSrs);
+    if (invTrans) {
+        invTrans->Transform(1, &utmX, &utmY);
+        OCTDestroyCoordinateTransformation(invTrans);
+        return QPointF(utmX, utmY);
+    }
+
+    // [THE FIX]: Safely return 0,0 instead of passing unprojected millions of meters to the UI
+    return QPointF(0, 0);
+}
+
+QPointF MapCanvasItem::getCenterLatLon() {
+    int sw = boundingRect().width();
+    int sh = boundingRect().height();
+    // Re-use the screen converter to get the exact true center of the canvas
+    return screenToLatLon(sw / 2, sh / 2);
+}
+
+double MapCanvasItem::getViewWidthKm() {
+    return m_viewWidthMeters / 1000.0;
+}
+
+void MapCanvasItem::setLzMarker(double lat, double lon) {
+    m_lzLat = lat; m_lzLon = lon; m_showLz = true; update();
+}
+void MapCanvasItem::setDzMarker(double lat, double lon, double heading) {
+    m_dzLat = lat; m_dzLon = lon; m_acHdg = heading; m_showDz = true; update();
+}
+void MapCanvasItem::clearDzMarker() {
+    m_showDz = false; update();
+}
+void MapCanvasItem::updateFlightLineHeading(double heading) {
+    m_acHdg = heading;
+    if (m_showDz) update();
+}
+
+MapCanvasItem::~MapCanvasItem() {
+    if (m_dataset) {
+        GDALClose(m_dataset);
+    }
+    VSIUnlink("/vsimem/osm_config.xml");
+}
+=== ./ui/mapcanvas/mapcanvas.hpp ===
+#pragma once
+#include <QQuickPaintedItem>
+#include <QImage>
+#include <QtQml/qqmlregistration.h>
+#include <gdal_priv.h> // Required for GDALDataset and GDAL types
+#include <gdal_utils.h>
+#include <ogr_spatialref.h>
+#include <gdalwarper.h>
+#include <QtConcurrent> // ADD THIS
+#include <atomic>
+
+class MapCanvasItem : public QQuickPaintedItem {
+    Q_OBJECT
+    QML_ELEMENT
+
+public:
+    MapCanvasItem(QQuickItem *parent = nullptr);
+    ~MapCanvasItem() override; // Declared the destructor
+
+    void paint(QPainter *painter) override;
+
+    // Callables from your QML files
+    Q_INVOKABLE void updateMission(double latitude, double longitude, double widthKm, double heightKm);
+    Q_INVOKABLE void downloadMapOffline();
+    // Q_INVOKABLE void loadOfflineMap(const QString& filePath);
+    Q_INVOKABLE void zoomMap(double factor);
+    Q_INVOKABLE void panMapPixels(int dx, int dy);
+    Q_INVOKABLE void commitPan();
+    // Explicitly declaring forceRefresh so QML can call it when the window resizes
+    Q_INVOKABLE void forceRefresh();
+    Q_INVOKABLE void drawEnvelope(const QVariantList& perimeterPoints);
+    Q_INVOKABLE QString estimateDownloadSize();
+
+    // ADD THESE: C++ Math functions for QML to call
+    // Q_INVOKABLE QPointF screenToGeo(int mouseX, int mouseY);
+    // Q_INVOKABLE QPointF getCenterGeo();
+    // Q_INVOKABLE double getViewWidthKm();
+    // Q_INVOKABLE void setViewWidthKm(double km);
+    // ADD THESE THREE:
+    Q_INVOKABLE QPointF screenToLatLon(int mouseX, int mouseY);
+    Q_INVOKABLE QPointF getCenterLatLon();
+    Q_INVOKABLE double getViewWidthKm();
+
+    Q_INVOKABLE void setLzMarker(double lat, double lon);
+    Q_INVOKABLE void setDzMarker(double lat, double lon, double heading);
+    Q_INVOKABLE void clearDzMarker();
+    Q_INVOKABLE void updateFlightLineHeading(double heading);
+
+signals:
+    // ADD THESE: Communicate state changes to QML
+    void viewChanged();
+    void downloadComplete();
+    void progressUpdated(QString taskName, double percent);
+    void errorReported(QString errorMessage);
+
+private:
+    void refreshMapBuffer(); // Moves heavy lifting out of paint()
+
+    QImage m_mapBuffer;
+
+    // ADD THESE: Tracks the temporary visual shift during a drag
+    int m_visualPanX = 0;
+    int m_visualPanY = 0;
+
+    double m_centerLat = 28.6139;
+    double m_centerLon = 77.2090;
+
+    // Declared the missing GDAL and projection variables
+    GDALDataset* m_dataset = nullptr;
+    // GDALDataset* m_warpedDataset = nullptr; // ADD THIS
+    double m_viewWidthMeters = 0.0;
+    double m_viewHeightMeters = 0.0;
+    double m_utmCenterX = 0.0;
+    double m_utmCenterY = 0.0;
+
+    double m_renderUtmCenterX = 0.0;
+    double m_renderUtmCenterY = 0.0;
+    double m_renderViewWidth = 0.0;
+    double m_renderViewHeight = 0.0;
+
+    double m_lzLat = 0.0;
+    double m_lzLon = 0.0;
+    bool m_showLz = false;
+
+    double m_dzLat = 0.0;
+    double m_dzLon = 0.0;
+    double m_acHdg = 0.0;
+    bool m_showDz = false;
+
+    QString m_utmWkt; // Caches the UTM projection string
+
+    QVariantList m_rawEnvelope; // Stores the Lat/Lon points so they can be redrawn on zoom/pan
+
+    // ADD THIS: Safely tracks the active live-fetch thread so rapid panning cancels old threads
+    std::atomic<int> m_fetchCounter{0};
+};
+=== ./ui/mapcanvas/MapCanvas.qml ===
+import QtQuick
+import QtQuick.Controls
+import ui
+
+MapCanvasForm {
+    id: root
+
+    property alias gdalRenderer: gdalRenderer
+    property bool mapInitialized: false
+
+    // ADDED: Delays the GDAL fetch so the GUI window has time to appear on your screen
+    Timer {
+        id: startupTimer
+        interval: 200
+        running: false
+        repeat: false
+        onTriggered: {
+            gdalRenderer.updateMission(28.6139, 77.2090, 50, 50)
+        }
+    }
+
+    MapCanvasItem {
+        id: gdalRenderer
+        anchors.fill: parent
+        z: -1
+
+        // ADD THIS: High-performance QML Crosshair Overlay
+        // Rectangle {
+        //     width: 20; height: 2; color: "#e53935"
+        //     anchors.centerIn: parent
+        //     border.color: "white"; border.width: 1
+        // }
+        // Rectangle {
+        //     width: 2; height: 20; color: "#e53935"
+        //     anchors.centerIn: parent
+        //     border.color: "white"; border.width: 1
+        // }
+        Item {
+            id: crosshair
+
+            property int crossLength: 20
+            property int barThickness: 2
+            // property color barColor: "#e53935"
+            property color barColor: "blue"
+            property color strokeColor: "blue"
+            property int strokeWidth: 1
+
+            width: crossLength + (strokeWidth * 2)
+            height: crossLength + (strokeWidth * 2)
+            anchors.centerIn: parent
+
+            Canvas {
+                anchors.fill: parent
+                antialiasing: true
+
+                onPaint: {
+                    var ctx = getContext("2d");
+                    ctx.reset();
+
+                    var halfT = crosshair.barThickness / 2;
+                    var halfL = crosshair.crossLength / 2;
+                    var cx = width / 2;
+                    var cy = height / 2;
+
+                    ctx.beginPath();
+
+                    // Top arm
+                    ctx.moveTo(cx - halfT, cy - halfL);
+                    ctx.lineTo(cx + halfT, cy - halfL);
+                    ctx.lineTo(cx + halfT, cy - halfT);
+
+                    // Right arm
+                    ctx.lineTo(cx + halfL, cy - halfT);
+                    ctx.lineTo(cx + halfL, cy + halfT);
+                    ctx.lineTo(cx + halfT, cy + halfT);
+
+                    // Bottom arm
+                    ctx.lineTo(cx + halfT, cy + halfL);
+                    ctx.lineTo(cx - halfT, cy + halfL);
+                    ctx.lineTo(cx - halfT, cy + halfT);
+
+                    // Left arm
+                    ctx.lineTo(cx + halfL, cy - halfT); // Adjusted boundary overlap path
+                    ctx.lineTo(cx - halfL, cy + halfT);
+                    ctx.lineTo(cx - halfL, cy - halfT);
+                    ctx.lineTo(cx - halfT, cy - halfT);
+
+                    ctx.closePath();
+
+                    ctx.fillStyle = crosshair.barColor;
+                    ctx.fill();
+
+                    ctx.strokeStyle = crosshair.strokeColor;
+                    ctx.lineWidth = crosshair.strokeWidth;
+                    ctx.lineJoin = "miter";
+                    ctx.stroke();
+                }
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+
+            property int lastX: 0
+            property int lastY: 0
+
+            enabled: selectButton.checked || tPointButton.checked
+
+            onPressed: (mouse) => {
+                forceActiveFocus()
+
+                if (tPointButton.checked) {
+                    let coord = gdalRenderer.screenToLatLon(mouse.x, mouse.y)
+                    window.dzLat = coord.y // Y is Lat
+                    window.dzLon = coord.x // X is Lon
+                    window.hasDz = true
+                    window.isDirty = true // Mark project as unsaved
+
+                    let hdg = parseFloat(window.airHeadingField.text) || 0.0
+                    gdalRenderer.setDzMarker(window.dzLat, window.dzLon, hdg)
+
+                    selectButton.checked = true // Auto-revert back to the pan tool
+                    return
+                }
+
+                lastX = mouse.x
+                lastY = mouse.y
+            }
+
+            onPositionChanged: (mouse) => {
+                // // ADD THIS: Instantly update the footer with real-world cursor Lat/Lon
+                // let geo = gdalRenderer.screenToGeo(mouse.x, mouse.y)
+                // window.coordinateLabel.text = "Lat: " + geo.x.toFixed(5) + " | Lon: " + geo.y.toFixed(5)
+
+                if (pressed) {
+                    let dx = mouse.x - lastX
+                    let dy = mouse.y - lastY
+
+                    gdalRenderer.panMapPixels(dx, dy)
+
+                    lastX = mouse.x
+                    lastY = mouse.y
+                }
+
+                // ADD THIS: Dynamic footer coordinate update
+                let coord = gdalRenderer.screenToLatLon(mouse.x, mouse.y)
+                // Assuming window is the global root ID for MainForm
+                window.coordinateLabel.text = "Lat: " + coord.y.toFixed(5) + " | Lon: " + coord.x.toFixed(5)
+            }
+
+            // ADD THIS: Finalize the pan and load the new map data
+            onReleased: {
+                gdalRenderer.commitPan()
+            }
+
+            onWheel: (wheel) => {
+                if (wheel.angleDelta.y > 0) {
+                    gdalRenderer.zoomMap(0.8)
+                } else {
+                    gdalRenderer.zoomMap(1.25)
+                }
+            }
+        }
+    }
+
+    ButtonGroup {
+        buttons: [selectButton, drawButton, tPointButton]
+    }
+
+    zoomInButton.onClicked: gdalRenderer.zoomMap(0.8)
+    zoomOutButton.onClicked: gdalRenderer.zoomMap(1.25)
+
+    onWidthChanged: {
+        if (width > 0 && height > 0) {
+            if (!mapInitialized) {
+                mapInitialized = true
+                startupTimer.start() // Trigger the delay
+            } else if (!startupTimer.running) {
+                gdalRenderer.forceRefresh()
+            }
+        }
+    }
+}
+=== ./ui/mapcanvas/MapCanvasForm.ui.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Rectangle {
+    id: root
+
+    // Expose dynamic labels
+    // property alias aoiBoxLabel: aoiBoxLabel
+    // property alias centerLabel: centerLabel
+    property alias zoomInButton: zoomInButton
+    property alias zoomOutButton: zoomOutButton
+    property alias selectButton: selectButton
+    property alias drawButton: drawButton
+
+    property alias tPointButton: tPointButton
+
+    Layout.fillWidth: true
+    Layout.fillHeight: true
+    // color: "#e8edf0"
+    color: "transparent"
+    clip: true
+
+    // Column {
+    //     anchors.centerIn: parent
+    //     spacing: 12
+    //
+    //     // Label {
+    //     //     anchors.horizontalCenter: parent.horizontalCenter
+    //     //     text: "MAP VIEWPORT"
+    //     //     font.pixelSize: 22
+    //     //     font.bold: true
+    //     //     color: "#455a64"
+    //     // }
+    //     //
+    //     // Label {
+    //     //     anchors.horizontalCenter: parent.horizontalCenter
+    //     //     text: "Map rendering will be implemented here"
+    //     //     color: "#607d8b"
+    //     // }
+    //
+    //     // Rectangle {
+    //     //     width: 220; height: 220
+    //     //     anchors.horizontalCenter: parent.horizontalCenter
+    //     //     color: "transparent"
+    //     //     border.color: "#1976d2"
+    //     //     border.width: 2
+    //     //
+    //     //     Label {
+    //     //         id: aoiBoxLabel
+    //     //         anchors.centerIn: parent
+    //     //         color: "#1565c0"
+    //     //     }
+    //     // }
+    //
+    //     // Label {
+    //     //     id: centerLabel
+    //     //     anchors.horizontalCenter: parent.horizontalCenter
+    //     //     color: "#455a64"
+    //     // }
+    // }
+
+    // FLOATING VERTICAL TOOLBOX
+    Rectangle {
+        id: floatingToolbox
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.rightMargin: 20
+
+        width: 44
+        height: toolboxLayout.implicitHeight + 16
+
+        color: "#ffffff"
+        border.color: "#cccccc"
+        border.width: 1
+        radius: 6
+
+        ColumnLayout {
+            id: toolboxLayout
+            anchors.centerIn: parent
+            spacing: 6
+
+            Button {
+                id: zoomInButton
+                text: "＋"
+                font.bold: true
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                ToolTip.text: "Zoom In"
+                ToolTip.visible: hovered
+            }
+
+            Button {
+                id: zoomOutButton
+                text: "－"
+                font.bold: true
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                ToolTip.text: "Zoom Out"
+                ToolTip.visible: hovered
+            }
+
+            // Separator line between zoom and tools
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 1
+                color: "#eeeeee"
+            }
+
+            Button {
+                id: selectButton
+                text: "⬈"
+                font.pixelSize: 14
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                checkable: true
+                checked: true // Default tool
+                ToolTip.text: "Select Tool"
+                ToolTip.visible: hovered
+            }
+
+            Button {
+                id: drawButton
+                text: "✎"
+                font.pixelSize: 16
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                checkable: true
+                ToolTip.text: "Draw AOI"
+                ToolTip.visible: hovered
+                visible: false
+            }
+
+            Button {
+                id: tPointButton
+                text: "T"
+                font.bold: true
+                font.pixelSize: 16
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                checkable: true
+                ToolTip.text: "Drop Zone (T-Point)"
+                ToolTip.visible: hovered
+            }
+        }
+    }
+}
+=== ./ui/mapcanvas/osm_config.xml ===
+<GDAL_WMS>
+    <Service name="TMS">
+        <ServerUrl>https://tile.openstreetmap.org/${z}/${x}/${y}.png</ServerUrl>
+    </Service>
+    <!-- ADD THESE TWO LINES TO BYPASS OSM BLOCKS -->
+    <UserAgent>Mozilla/5.0 (Windows NT 10.0; Win64; x64) MissionPlanner/1.0</UserAgent>
+    <Timeout>4</Timeout>
+
+    <DataWindow>
+        <UpperLeftX>-20037508.34</UpperLeftX>
+        <UpperLeftY>20037508.34</UpperLeftY>
+        <LowerRightX>20037508.34</LowerRightX>
+        <LowerRightY>-20037508.34</LowerRightY>
+        <TileLevel>19</TileLevel>
+        <TileCountX>1</TileCountX>
+        <TileCountY>1</TileCountY>
+        <YOrigin>top</YOrigin>
+    </DataWindow>
+    <Projection>EPSG:3857</Projection>
+    <BlockSizeX>256</BlockSizeX>
+    <BlockSizeY>256</BlockSizeY>
+    <BandsCount>3</BandsCount>
+    <Cache>
+        <Path>%1</Path>
+        <Depth>2</Depth>
+        <Extension>.png</Extension>
+    </Cache>
+</GDAL_WMS>
+=== ./ui/mappanel/MapPanel.qml ===
+import QtQuick
+
+MapPanelForm {
+    // Implement Map Panel logic here
+    // e.g., mapCheck.onCheckedChanged: console.log("Map checked:", mapCheck.checked)
+    id: root
+
+    // ADD THIS: Jump Logic
+    function applyView() {
+        let lat = parseFloat(centerLatField.text)
+        let lon = parseFloat(centerLonField.text)
+        let widthKm = parseFloat(viewWidthField.text)
+
+        if (isNaN(lat) || isNaN(lon) || isNaN(widthKm)) {
+            window.showError("Please enter valid numeric coordinates and width.")
+            return
+        }
+
+        // [THE FIX]: Forcibly drop active focus so the fields can receive live updates again
+        centerLatField.focus = false
+        centerLonField.focus = false
+        viewWidthField.focus = false
+
+        // C++ updateMission automatically handles the jump and re-centers the UTM projection
+        window.gdalRenderer.updateMission(lat, lon, widthKm, widthKm)
+    }
+
+    applyViewButton.onClicked: applyView()
+    centerLatField.onAccepted: applyView()
+    centerLonField.onAccepted: applyView()
+    viewWidthField.onAccepted: applyView()
+
+    downloadMap.onClicked: {
+        downloadMap.text = "Downloading (Background)..."
+        downloadMap.enabled = false
+        mapCanvas.gdalRenderer.downloadMapOffline()
+    }
+
+    // Connections {
+    //     target: mapCanvas.gdalRenderer
+    //
+    //     function onViewChanged() {
+    //         sizeEstimateLabel.text = "Est. Cache Size: " + mapCanvas.gdalRenderer.estimateDownloadSize()
+    //     }
+    //
+    //     function onDownloadComplete() {
+    //         downloadMap.text = "Download map with checked features"
+    //         downloadMap.enabled = true
+    //     }
+    // }
+    Connections {
+        target: window.gdalRenderer // Ensure the alias points to the global window
+
+        function onViewChanged() {
+            sizeEstimateLabel.text = "Est. Cache Size: " + window.gdalRenderer.estimateDownloadSize()
+
+            // ADD THIS: Sync fields with actual Canvas state
+            let center = window.gdalRenderer.getCenterLatLon()
+            // Ensure fields are only updated if they are not actively being typed in
+            if (!centerLatField.activeFocus && !centerLonField.activeFocus && !viewWidthField.activeFocus) {
+                centerLatField.text = center.y.toFixed(5)
+                centerLonField.text = center.x.toFixed(5)
+                viewWidthField.text = window.gdalRenderer.getViewWidthKm().toFixed(2)
+            }
+        }
+
+        function onDownloadComplete() {
+            downloadMap.text = "Download map with checked features"
+            downloadMap.enabled = true
+        }
+    }
+}
+=== ./ui/mappanel/MapPanelForm.ui.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Frame {
+    id: root
+    // Layout.preferredWidth: 270
+    // Layout.fillHeight: true
+
+    // Removes the white background and black frame border
+    background: Item {}
+
+    property alias mapCheck: mapCheck
+    // property alias aoiCheck: aoiCheck
+    property alias elevationCheck: elevationCheck
+    property alias downloadMap: downloadMap
+    property alias sizeEstimateLabel: sizeEstimateLabel
+
+    // ADD THESE:
+    property alias centerLatField: centerLatField
+    property alias centerLonField: centerLonField
+    property alias viewWidthField: viewWidthField
+    property alias applyViewButton: applyViewButton
+
+    ScrollView {
+        anchors.fill: parent
+        contentWidth: width // Prevents horizontal scrolling
+        clip: true // Hides content that scrolls outside the panel bounds
+
+        ColumnLayout {
+            // anchors.fill: parent
+            width: parent.width
+            spacing: 12
+
+            Label {
+                text: "MAP"
+                font.bold: true
+                font.pixelSize: 16
+            }
+
+            CheckBox {
+                id: mapCheck
+                text: "Map"
+                checked: true
+                visible: false
+            }
+
+            // CheckBox {
+            //     id: aoiCheck
+            //     text: "AOI boundary"
+            //     checked: true
+            // }
+
+            CheckBox {
+                id: elevationCheck
+                text: "Elevation contours"
+                checked: false
+                visible: false
+            }
+
+            Label {
+                id: sizeEstimateLabel
+                text: "Est. Cache Size: 0 MB"
+                color: "#666666"
+                font.pixelSize: 11
+            }
+
+            // ADD THIS BLOCK:
+            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#dddddd" }
+
+            Label { text: "Canvas Center (Lat / Lon)" }
+            RowLayout {
+                Layout.fillWidth: true
+                TextField { id: centerLatField; Layout.fillWidth: true; placeholderText: "Latitude" }
+                TextField { id: centerLonField; Layout.fillWidth: true; placeholderText: "Longitude" }
+            }
+
+            Label { text: "Camera View Width (km)" }
+            RowLayout {
+                Layout.fillWidth: true
+                TextField { id: viewWidthField; Layout.fillWidth: true; placeholderText: "Width in km" }
+                Button { id: applyViewButton; text: "Go" }
+            }
+
+            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: "#dddddd" }
+            // END BLOCK
+
+            Button {
+                id: downloadMap
+                text: "Download map with checked features"
+            }
+
+            Item {
+                Layout.fillHeight: true
+            }
+        }
+    }
+}
+=== ./ui/missionpanel/MissionPanel.qml ===
+import QtQuick
+import QtQuick.Controls
+import handle // Import the module where MissionController resides
+
+MissionPanelForm {
+    id: root
+
+    generateButton.onClicked: {
+        // Harvest all UI strings, convert to floats, and pack into a JS Object
+        let missionData = {
+            "lzLat": parseFloat(latitudeField.text) || 0.0,
+            "lzLon": parseFloat(longitudeField.text) || 0.0,
+            "lzElev": parseFloat(elevationField.text) || 0.0,
+            "jumpAlt": parseFloat(jumpAltField.text) || 0.0,
+            "openAlt": parseFloat(canopyAltField.text) || 0.0,
+            "weight": parseFloat(weightField.text) || 0.0,
+            "acVel": parseFloat(airSpeedField.text) || 0.0,
+            "acHdg": parseFloat(airHeadingField.text) || 0.0,
+            "canopyVel": parseFloat(canopyGroundSpeedField.text) || 0.0,
+            "glideRatio": parseFloat(glideRatioField.text) || 0.0
+        }
+
+        // ADD THIS: Harvest the current state of the Wind Profile table
+        let windArray = []
+        for (let i = 0; i < window.windModel.count; i++) {
+            let row = window.windModel.get(i)
+            windArray.push({
+                "altitude": parseFloat(row.altitude) || 0.0,
+                "speed": parseFloat(row.speed) || 0.0,
+                "heading": parseFloat(row.heading) || 0.0
+            })
+        }
+        missionData["windProfile"] = windArray
+
+        console.log("Sending parameters to physics engine...")
+        MissionController.runMission(window.buildProjectJson())
+        // MissionController.runMission(missionData)
+    }
+
+    airHeadingField.onTextChanged: {
+        if (window.hasDz) {
+            window.mapCanvas.gdalRenderer.updateFlightLineHeading(parseFloat(airHeadingField.text) || 0.0)
+        }
+    }
+}
+=== ./ui/missionpanel/MissionPanelForm.ui.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Frame {
+    id: root
+
+    // property alias mapCenterField: mapCenterField
+    // property alias mapCenterButton: mapCenterButton
+
+    // Expose interactive elements to the parent
+    property alias lzNameField: lzName
+    property alias latitudeField: latitudeField
+    property alias longitudeField: longitudeField
+    property alias generateButton: generateButton
+
+    property alias elevationField: elevationField
+    property alias dateField: dateField // ADD THIS
+    property alias timeField: timeField // ADD THIS
+    property alias jumpAltField: jumpAltField
+    property alias canopyAltField: canopyAltField
+    property alias weightField: weightField
+    property alias airSpeedField: airSpeedField
+    property alias airHeadingField: airHeadingField
+    property alias canopyGroundSpeedField: canopyGroundSpeedField
+    property alias glideRatioField: glideRatioField
+
+    Layout.preferredWidth: 270
+    Layout.fillHeight: true
+
+    // Wrap the content in a ScrollView to enable vertical scrolling
+    ScrollView {
+        anchors.fill: parent
+        contentWidth: width // Prevents horizontal scrolling
+        clip: true // Hides content that scrolls outside the panel bounds
+
+        ColumnLayout {
+            // Bind width to the ScrollView, removing anchors.fill so it can grow vertically
+            width: parent.width
+            spacing: 0
+
+            Label {
+                text: "MISSION"
+                font.bold: true
+                font.pixelSize: 16
+                Layout.bottomMargin: 10
+            }
+
+            ToolButton {
+                id: lzHeader
+                text: checked ? "▼ LZ Parameters" : "▶ LZ Parameters"
+                font.bold: true
+                Layout.fillWidth: true
+                checkable: true
+                checked: true
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: lzHeader.checked
+
+                Layout.leftMargin: 12
+                Layout.topMargin: 5
+                Layout.bottomMargin: 15
+                spacing: 8
+
+                Label { text: "LZ Name" }
+                TextField {
+                    id: lzName
+                    Layout.fillWidth: true
+                    placeholderText: "Area 51"
+                }
+                Label { text: "Latitude (degrees)" }
+                TextField {
+                    id: latitudeField
+                    Layout.fillWidth: true
+                    placeholderText: "Latitude"
+                    validator: RegularExpressionValidator {
+                        regularExpression: /^-?(?:90(?:\.0*)?|[0-8]?\d(?:\.\d*)?)$/
+                    }
+                }
+                Label { text: "Longitude (degrees)" }
+                TextField {
+                    id: longitudeField
+                    Layout.fillWidth: true
+                    placeholderText: "Longitude"
+                    validator: RegularExpressionValidator {
+                        regularExpression: /^-?(?:180(?:\.0*)?|1[0-7]\d(?:\.\d*)?|[0-9]?\d(?:\.\d*)?)$/
+                    }
+                }
+                Label { text: "Elevation (meters)" }
+                TextField {
+                    id: elevationField
+                    Layout.fillWidth: true
+                    placeholderText: "200"
+                }
+
+                // ADD THESE TWO BLOCKS:
+                Label { text: "Date (YYYY-MM-DD UTC)" }
+                TextField {
+                    id: dateField
+                    Layout.fillWidth: true
+                    placeholderText: "2026-10-25"
+                }
+                Label { text: "Time (HH:MM UTC)" }
+                TextField {
+                    id: timeField
+                    Layout.fillWidth: true
+                    placeholderText: "12:00"
+                }
+            }
+
+            ToolButton {
+                id: jumpHeader
+                text: checked ? "▼ Jump Parameters" : "▶ Jump Parameters"
+                font.bold: true
+                Layout.fillWidth: true
+                checkable: true
+                checked: true
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: jumpHeader.checked
+
+                Layout.leftMargin: 12
+                Layout.topMargin: 5
+                Layout.bottomMargin: 15
+                spacing: 8
+
+                Label { text: "Jump Altitude (ft)" }
+                TextField{
+                    id: jumpAltField
+                    Layout.fillWidth: true
+                    placeholderText: "7200"
+                }
+
+                Label { text: "Canopy Opening Altitude (ft)" }
+                TextField{
+                    id: canopyAltField
+                    Layout.fillWidth: true
+                    placeholderText: "5500"
+                }
+
+                Label { text: "Net Weight (kg)" }
+                TextField{
+                    id: weightField
+                    Layout.fillWidth: true
+                    placeholderText: "92"
+                }
+            }
+
+            ToolButton {
+                id: aircraftHeader
+                text: checked ? "▼ Aircraft Parameters" : "▶ Aircraft Parameters"
+                font.bold: true
+                Layout.fillWidth: true
+                checkable: true
+                checked: true
+            }
+            ColumnLayout{
+                Layout.fillWidth: true
+                visible: aircraftHeader.checked
+
+                Layout.leftMargin: 12
+                Layout.topMargin: 5
+                Layout.bottomMargin: 15
+                spacing: 8
+
+                Label { text: "Speed (kts)" }
+                TextField {
+                    id: airSpeedField
+                    Layout.fillWidth: true
+                }
+                Label { text: "Heading (deg)" }
+                TextField {
+                    id: airHeadingField
+                    Layout.fillWidth: true
+                }
+            }
+
+            ToolButton {
+                id: parachuteHeader
+                text: checked ? "▼ Parachute Parameters" : "▶ Parachute Parameters"
+                font.bold: true
+                Layout.fillWidth: true
+                checkable: true
+                checked: true
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: parachuteHeader.checked
+
+                Layout.leftMargin: 12
+                Layout.topMargin: 5
+                Layout.bottomMargin: 15
+                spacing: 8
+
+                Label { text: "Ground Speed (kts)" }
+                TextField {
+                    id: canopyGroundSpeedField
+                    Layout.fillWidth: true
+                }
+                Label { text: "Glide Ratio" }
+                TextField {
+                    id: glideRatioField
+                    Layout.fillWidth: true
+                }
+            }
+
+            Button {
+                id: generateButton
+                text: "Run"
+                Layout.fillWidth: true
+                Layout.topMargin: 10 // Added a slight margin to separate it from the expanding groups
+            }
+
+            Item { Layout.fillHeight: true }
+        }
+    }
+}
+=== ./ui/windpanel/WindPanel.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import handle
+
+WindPanelForm {
+    id: root
+
+    windListView.delegate: RowLayout {
+        width: windListView.width
+        spacing: 6
+
+        TextField {
+            text: model.altitude
+            Layout.fillWidth: true
+            horizontalAlignment: TextInput.AlignHCenter
+            // Critical: Saves manual edits back to the model so C++ gets the changes on Run
+            onTextChanged: model.altitude = text
+        }
+        TextField {
+            text: model.speed
+            Layout.fillWidth: true
+            horizontalAlignment: TextInput.AlignHCenter
+            onTextChanged: model.speed = text
+        }
+        TextField {
+            text: model.heading
+            Layout.fillWidth: true
+            horizontalAlignment: TextInput.AlignHCenter
+            onTextChanged: model.heading = text
+        }
+        Button {
+            text: "🗑"
+            Layout.preferredWidth: 28
+            Layout.preferredHeight: 28
+            onClicked: {
+                windModel.remove(index)
+            }
+        }
+    }
+
+    addRowButton.onClicked: {
+        windModel.append({
+            "altitude": "",
+            "speed": "",
+            "heading": ""
+        })
+        windListView.positionViewAtEnd()
+    }
+
+    fetchButton.onClicked: {
+        let lat = parseFloat(window.latitudeField.text)
+        let lon = parseFloat(window.longitudeField.text)
+        let dateStr = window.dateField.text
+        let timeStr = window.timeField.text
+
+        if (isNaN(lat) || isNaN(lon) || dateStr.length !== 10 || timeStr.length !== 5) {
+            window.showError("Please enter valid LZ Lat/Lon and Date (YYYY-MM-DD) / Time (HH:MM).")
+            return
+        }
+
+        // Trigger the C++ fetch thread
+        // Prompt for save first, then fetch
+        window.requireSaveThen(function() {
+            MissionController.fetchWindProfile(lat, lon, dateStr, timeStr)
+        })
+    }
+
+    // Catch the returned C++ wind data and populate the UI table
+    Connections {
+        target: MissionController
+
+        function onWindProfileFetched(windData) {
+            windModel.clear()
+
+            for (let i = 0; i < windData.length; i++) {
+                windModel.append(windData[i])
+            }
+
+            windListView.positionViewAtBeginning()
+        }
+    }
+}
+=== ./ui/windpanel/WindPanelForm.ui.qml ===
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Frame {
+    id: root
+    background: Item {}
+
+    // Expose components for logic binding in WindPanel.qml
+    property alias windModel: windModel
+    property alias windListView: windListView
+    property alias addRowButton: addRowButton
+    property alias fetchButton: fetchButton
+
+    ColumnLayout {
+        // anchors.fill: parent
+        width: parent.width
+        height: parent.height
+        spacing: 8
+
+        Label {
+            text: "WIND PROFILE"
+            font.bold: true
+            font.pixelSize: 16
+            Layout.bottomMargin: 4
+        }
+
+        // Table Header
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 6
+
+            Label {
+                text: "Altitude (ft)"
+                Layout.fillWidth: true
+                font.bold: true
+                font.pixelSize: 12
+                horizontalAlignment: Text.AlignHCenter
+            }
+            Label {
+                text: "Speed"
+                Layout.fillWidth: true
+                font.bold: true
+                font.pixelSize: 12
+                horizontalAlignment: Text.AlignHCenter
+            }
+            Label {
+                text: "Heading"
+                Layout.fillWidth: true
+                font.bold: true
+                font.pixelSize: 12
+                horizontalAlignment: Text.AlignHCenter
+            }
+            // Reserve space for the trash button column
+            Item {
+                Layout.preferredWidth: 28
+            }
+        }
+
+        // Table Content (Scrollable List)
+        ListView {
+            id: windListView
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            clip: true
+            spacing: 4
+
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+                active: true
+            }
+
+            model: ListModel {
+                id: windModel
+                // 5 default rows
+                ListElement { altitude: "1000"; speed: "0.0"; heading: "0" }
+                ListElement { altitude: "2000"; speed: "0.0"; heading: "0" }
+                ListElement { altitude: "3000"; speed: "0.0"; heading: "0" }
+                ListElement { altitude: "4000"; speed: "0.0"; heading: "0" }
+                ListElement { altitude: "5000"; speed: "0.0"; heading: "0" }
+            }
+
+            // delegate: RowLayout {
+            //     width: windListView.width
+            //     spacing: 6
+            //
+            //     TextField {
+            //         text: model.altitude
+            //         Layout.fillWidth: true
+            //         horizontalAlignment: TextInput.AlignHCenter
+            //     }
+            //     TextField {
+            //         text: model.speed
+            //         Layout.fillWidth: true
+            //         horizontalAlignment: TextInput.AlignHCenter
+            //     }
+            //     TextField {
+            //         text: model.heading
+            //         Layout.fillWidth: true
+            //         horizontalAlignment: TextInput.AlignHCenter
+            //     }
+            // }
+        }
+
+        // Action Buttons
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+            Layout.topMargin: 4
+
+            Button {
+                id: addRowButton
+                text: "＋ Add Row"
+                Layout.fillWidth: true
+            }
+
+            Button {
+                id: fetchButton
+                text: "☁ Fetch Online"
+                Layout.fillWidth: true
+            }
+        }
+    }
+}
